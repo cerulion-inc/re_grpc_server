@@ -75,8 +75,36 @@ Files touched, all in `src/lib.rs` (plus literal updates so the crate compiles):
 > (cargo does not compile a dependency's own unit tests), so the production
 > `[lib]` artifact `cerulion-base` builds was always correct and unchanged. The
 > fork adds `drop_temporal_history: false` to that literal so the fork's own
-> `cargo test` is green (15/15). The change is inside `#[cfg(test)]` — the
+> `cargo test` is green (15/15 at fork creation; 18/18 after the F1/F2
+> review-train tests below). The change is inside `#[cfg(test)]` — the
 > compiled dependency artifact is byte-identical to the vendored tree.
+
+## History-bounding under `drop_temporal` (F1 + F2, CER-858 review train)
+
+Under `drop_temporal_history`, the stock `gc()` is OFF (every retained frame is a
+needed skeleton frame — a `memory_limit` eviction could only drop something a late
+joiner needs). Two paths would otherwise grow the retained history **without
+bound**, so both are bounded at buffer time — **ONLY under the flag**; with
+`drop_temporal_history == false` behavior is byte-identical to upstream.
+
+| # | Unbounded path | Fix |
+|---|---|---|
+| F1 | `persistent` grows on every Studio `set_blueprint`: each layout change mints a **FRESH blueprint store**, and every new client would replay ALL superseded blueprints. | When a `BlueprintActivationCommand` for blueprint `B` is buffered, evict from `persistent` every message belonging to a Blueprint-KIND store ≠ `B` (its `SetStoreInfo`, chunks, and stale activation commands), preserving relative order + exact `size_bytes`. A recording-data `SetStoreInfo` is **not** blueprint-kind, so it always survives. Keyed on the blueprint store's `recording_id` (its unique uuid). Gated on the flag — stock upstream keeps every blueprint (the flag's owner activates each new blueprint `make_active`, so "activated = supersedes prior" is exact for Studio). |
+| F2 | `static_` grows on every reconnect: a reconnecting client re-logs the same statics, appending duplicates. | A static `ArrowMsg` for entity `E` **REPLACES** the prior retained static for the same `(store_id, E)` (latest-wins, matching rerun's own static semantics) instead of appending. The entity path is decoded from the arrow payload (`ArrowMsg::to_application` → the batch schema's `rerun:entity_path` metadata) **only on the infrequent static path**; a decode failure falls back to a plain append (never a wrong-key drop). |
+
+> **F2 caveat.** Replacement is **entity-level**: logging DIFFERENT component sets
+> statically to the SAME entity across sends would drop the earlier components.
+> vizd never does this — statics are logged once per entity and re-logged
+> IDENTICALLY on reconnect — so entity-level replacement is exactly latest-wins
+> with no loss.
+
+Files: all in `src/lib.rs` — `MessageBuffer::{evict_superseded_blueprints,
+message_store_id, static_key_from_arrow, static_key_from_msg}`, `MsgQueue::retain`
+(order-preserving, byte-exact), and the split `add_log_msg`
+blueprint-activation / static arms. Pinned by the fork tests
+`drop_temporal_evicts_superseded_blueprint_stores`,
+`drop_temporal_blueprint_eviction_preserves_activation_ordering`, and
+`drop_temporal_dedups_static_relog_per_entity`.
 
 `memory_limit` / `playback_behavior` semantics are **byte-identical to upstream
 when `drop_temporal_history == false`**. When the flag is set, the mode is
@@ -86,36 +114,36 @@ once by the producer — so a `memory_limit`-driven eviction could only ever dro
 something a late joiner needs). `memory_limit` is therefore **moot** under the
 flag.
 
-Total functional delta: ~16 lines. No `unsafe`, no new deps, no signature
-changes to public functions (only an additive struct field).
+Base drop-temporal delta: ~16 lines (the review-train history-bounding is the
+separate F1/F2 section below). No `unsafe`, no new deps (F1/F2 reuse the existing
+`re_sorbet` / `re_log_encoding` deps), no signature changes to public functions
+(only an additive struct field).
 
 ## `Cargo.toml` transformation (packaging cleanup, `main` vs `upstream`)
 
 The `upstream` branch carries the crates.io-normalized `Cargo.toml` verbatim. On
 `main` the manifest is rewritten for a `git`-dependency fork (semantically
-dependency-identical — the compiled crate is unchanged):
+dependency-identical — the compiled crate is unchanged). The full transformation:
 
-- Packaging-only fields dropped: `build = false`, `include`, `publish = true`,
-  `homepage`, `readme`, `repository`, `[package.metadata.docs.rs]` — a
-  git-pinned fork is never published to crates.io.
-- `description` gains a `(Cerulion vendored fork, CER-858)` suffix.
-- Dependencies reformatted from the crates.io `[dependencies.<name>]` table form
-  into inline `[dependencies]` entries (identical versions + features).
-- The upstream `[lints.clippy]` / `[lints.rust]` / `[lints.rustdoc]` blocks
-  (including `unsafe_code = "deny"`) are dropped — they were rerun's workspace
-  lint set, irrelevant to a consumed dependency. (The patch adds no `unsafe`.)
+| Manifest / file change | Detail |
+|---|---|
+| Packaging-only fields dropped | `build = false`, `include`, `publish = true`, `homepage`, `readme`, `repository`, `[package.metadata.docs.rs]` — a git-pinned fork is never published to crates.io. |
+| `description` suffixed | `(Cerulion vendored fork, CER-858)`. |
+| Dependencies reformatted | From the crates.io `[dependencies.<name>]` table form into inline `[dependencies]` entries (identical versions + features). |
+| `[lints.*]` **RESTORED** (F3) | The upstream `[lints.clippy]` / `[lints.rust]` / `[lints.rustdoc]` blocks (incl. `unsafe_code = "deny"`) — the crates.io materialization of the rerun **workspace** lints (workspace root `Cargo.toml` @ `4efb18f17f6f0e41985cda99a2bdcd012febc8d5`, identical to the `upstream` branch's flattened blocks) — are carried **verbatim**. An earlier fork revision had dropped them (fidelity loss). The patch adds no `unsafe`; the whole crate + tests build clean under them. The lint name `empty_enum` is kept verbatim as the workspace has it (a newer clippy renamed it to `empty_enums` — a benign toolchain-drift *warning* under `-D warnings`, clippy still exits 0). |
+| `clippy.toml` **added** (F3) | `allow-unwrap-in-tests = true`, mirroring the ONE setting from rerun's workspace `clippy.toml` that the restored `unwrap_used = "warn"` depends on. Keeps `unwrap_used` protecting **production** code while exempting this crate's own `#[cfg(test)]` code (invisible when consumed as a dependency, since cargo does not compile a dependency's tests). No lint was dropped. |
 
-These `Cargo.toml` changes are the ONLY divergence beyond the ~16-line functional
-patch, and they change no dependency, feature, or compiled behavior.
+These `Cargo.toml` / `clippy.toml` changes change no dependency, feature, or
+compiled behavior.
 
 ## Compatibility notes
 
-- **`src/lib.rs` doc pointer.** The `ServerOptions::drop_temporal_history` doc
-  comment ends with `See vendor/re_grpc_server/CERULION-PATCH.md.` — a stale path
-  from the pre-fork vendored era. It is **left byte-identical to the tree
-  `cerulion-base` built and tested green** (build fidelity of the git pin > a
-  cosmetic comment). The authoritative copy of this document is at this repo's
-  root (`CERULION-PATCH.md`).
+- **`src/lib.rs` doc pointer (F5).** The `ServerOptions::drop_temporal_history`
+  doc comment now points at `CERULION-PATCH.md` at this crate's root — the
+  authoritative copy of this document. It previously carried the stale pre-fork
+  `vendor/re_grpc_server/CERULION-PATCH.md` path (fixed in the CER-858 review
+  train; the same edit backticks `re_grpc_server` to satisfy the restored
+  `doc_markdown` lint).
 
 - **Upstream `ServerOptions` literals under other features.** Upstream constructs
   `ServerOptions` with explicit-field literals (no `..Default::default()`) in
