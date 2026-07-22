@@ -72,6 +72,17 @@ pub struct ServerOptions {
     /// - `"https://example.com:8080"` — exact origin with a specific port
     /// - `"https://example.com:*"` — any port on example.com
     pub cors_allowed_origins: Vec<String>,
+
+    /// CERULION PATCH (CER-858): when `true`, the history buffer NEVER retains
+    /// disposable/temporal messages (recording data) — only `persistent`
+    /// (`SetStoreInfo` + blueprint + `BlueprintActivationCommand`) and `static_`
+    /// (`is_static` chunks). A fresh client's connect-history then carries the
+    /// SCENE SKELETON with ZERO temporal replay, at ANY producer bandwidth
+    /// (Cerulion Studio's instant-only live viz). Live subscribers still receive
+    /// live temporal data via the broadcast; it is only the per-client REPLAY
+    /// buffer that drops it. Default `false` (stock re_grpc_server behavior). See
+    /// `vendor/re_grpc_server/CERULION-PATCH.md`.
+    pub drop_temporal_history: bool,
 }
 
 impl Default for ServerOptions {
@@ -80,6 +91,7 @@ impl Default for ServerOptions {
             playback_behavior: PlaybackBehavior::OldestFirst,
             memory_limit: MemoryLimit::from_bytes(1024 * 1024 * 1024), // Be very conservative by default
             cors_allowed_origins: Vec::new(),
+            drop_temporal_history: false, // CERULION PATCH (CER-858)
         }
     }
 }
@@ -773,6 +785,13 @@ struct MessageBuffer {
 
     /// These are never garbage collected.
     persistent: MsgQueue,
+
+    /// CERULION PATCH (CER-858): when `true`, [`Self::add_msg`] DROPS disposable
+    /// (temporal) messages instead of buffering them, so the per-client
+    /// connect-history carries only `persistent` + `static_` (the scene
+    /// skeleton) with zero temporal replay. Set from
+    /// [`ServerOptions::drop_temporal_history`].
+    drop_temporal: bool,
 }
 
 impl MessageBuffer {
@@ -781,6 +800,7 @@ impl MessageBuffer {
             disposable,
             static_,
             persistent,
+            drop_temporal: _, // CERULION PATCH (CER-858)
         } = self;
         disposable.size_bytes + static_.size_bytes + persistent.size_bytes
     }
@@ -792,6 +812,7 @@ impl MessageBuffer {
             disposable,
             static_,
             persistent,
+            drop_temporal: _, // CERULION PATCH (CER-858)
         } = self;
 
         // Note: we ALWAYS send the persistent and static data before the disposable,
@@ -817,10 +838,15 @@ impl MessageBuffer {
         match msg {
             LogOrTableMsgProto::LogMsg(msg) => self.add_log_msg(msg),
             LogOrTableMsgProto::Table(msg) => {
-                self.disposable.push_back(msg.into());
+                // CERULION PATCH (CER-858): tables/ui-commands are disposable.
+                if !self.drop_temporal {
+                    self.disposable.push_back(msg.into());
+                }
             }
             LogOrTableMsgProto::UiCommand(msg) => {
-                self.disposable.push_back(msg.into());
+                if !self.drop_temporal {
+                    self.disposable.push_back(msg.into());
+                }
             }
         }
     }
@@ -854,8 +880,10 @@ impl MessageBuffer {
                     self.persistent.push_back(msg.into());
                 } else if inner.is_static == Some(true) {
                     self.static_.push_back(msg.into());
-                } else {
-                    // Recording data
+                } else if !self.drop_temporal {
+                    // Recording data (temporal). CERULION PATCH (CER-858): dropped
+                    // (never buffered) when `drop_temporal` is set — the per-client
+                    // connect-history stays scene-skeleton-only.
                     self.disposable.push_back(msg.into());
                 }
             }
@@ -980,11 +1008,16 @@ impl EventLoop {
         broadcast_log_tx: async_broadcast_channel::Sender<LogOrTableMsgProto>,
         memory_snapshot: MemorySnapshot,
     ) -> Self {
+        // CERULION PATCH (CER-858): thread the drop-temporal mode into the buffer.
+        let history = MessageBuffer {
+            drop_temporal: options.drop_temporal_history,
+            ..Default::default()
+        };
         Self {
             options,
             broadcast_log_tx,
             event_rx,
-            history: Default::default(),
+            history,
             memory_snapshot,
         }
     }
@@ -1041,11 +1074,19 @@ impl EventLoop {
     }
 
     fn is_history_enabled(&self) -> bool {
-        self.options.memory_limit != MemoryLimit::ZERO
+        // CERULION PATCH (CER-858): drop-temporal mode retains the scene skeleton
+        // (persistent + static_) regardless of `memory_limit` — so history is
+        // "enabled" for statics even when the byte budget is ZERO.
+        self.options.memory_limit != MemoryLimit::ZERO || self.options.drop_temporal_history
     }
 
     fn gc_if_using_too_much_ram(&mut self) {
-        if self.options.memory_limit.is_limited() {
+        // CERULION PATCH (CER-858): under drop-temporal, the buffer holds ONLY
+        // statics + persistent (temporal is never buffered) — all of which are
+        // needed by every late joiner — so `memory_limit`-driven GC is OFF (it
+        // would only ever evict needed statics). The mode is self-contained;
+        // `memory_limit` is moot under it.
+        if !self.options.drop_temporal_history && self.options.memory_limit.is_limited() {
             self.history.gc(self.options.memory_limit.as_bytes());
         }
     }
@@ -1507,6 +1548,7 @@ mod tests {
             playback_behavior: PlaybackBehavior::OldestFirst,
             memory_limit: MemoryLimit::UNLIMITED,
             cors_allowed_origins: vec![],
+            drop_temporal_history: false, // CERULION PATCH (CER-858)
         })
         .await
     }
@@ -1516,6 +1558,20 @@ mod tests {
             playback_behavior: PlaybackBehavior::OldestFirst,
             memory_limit,
             cors_allowed_origins: vec![],
+            drop_temporal_history: false, // CERULION PATCH (CER-858)
+        })
+        .await
+    }
+
+    // CERULION PATCH (CER-858): a proxy that DROPS temporal history (retain
+    // persistent + static_ only) at an unlimited byte budget — the Studio
+    // instant-only live-viz mode.
+    async fn setup_drop_temporal() -> (Completion, SocketAddr) {
+        setup_opt(ServerOptions {
+            playback_behavior: PlaybackBehavior::NewestFirst,
+            memory_limit: MemoryLimit::UNLIMITED,
+            cors_allowed_origins: vec![],
+            drop_temporal_history: true,
         })
         .await
     }
@@ -1782,6 +1838,62 @@ mod tests {
         completion.finish();
     }
 
+    // CERULION PATCH (CER-858): with `drop_temporal_history`, a fresh client's
+    // connect-history carries the SetStoreInfo + static frames but NONE of the
+    // temporal (recording) frames — zero temporal replay, at unlimited budget.
+    #[tokio::test]
+    async fn drop_temporal_history_retains_statics_not_temporal() {
+        let (completion, addr) = setup_drop_temporal().await;
+        let mut client = make_client(addr).await;
+
+        let store_id = StoreId::random(StoreKind::Recording, "test_app");
+        let statics = generate_log_messages(&store_id, 2, Temporalness::Static);
+        let temporal = generate_log_messages(&store_id, 3, Temporalness::Temporal);
+        let mut messages = vec![set_store_info_msg(&store_id)];
+        messages.extend(statics.clone());
+        messages.extend(temporal.clone());
+
+        // Write everything with NO client reading yet → the temporal frames must
+        // be dropped from history immediately (never buffered).
+        write_messages(&mut client, messages).await;
+
+        // Start reading → we should receive ONLY the persistent + static frames.
+        let mut log_stream = client.read_messages(ReadMessagesRequest {}).await.unwrap();
+        let mut actual = vec![];
+        loop {
+            let timeout_stream = log_stream.get_mut().timeout(Duration::from_millis(100));
+            tokio::pin!(timeout_stream);
+            let mut app_id_cache = re_log_encoding::CachingApplicationIdInjector::default();
+            match timeout_stream.try_next().await {
+                Ok(Some(value)) => {
+                    let msg = value.unwrap().log_msg.unwrap().msg.unwrap();
+                    actual.push(msg.to_application((&mut app_id_cache, None)).unwrap());
+                }
+                Ok(None) | Err(_) => break,
+            }
+        }
+
+        // Hand oracle: SetStoreInfo (persistent) + the 2 static frames survive;
+        // every temporal frame is absent (dropped, not buffered).
+        assert_eq!(
+            actual.len(),
+            3,
+            "connect-history = SetStoreInfo + 2 statics, temporal dropped: {actual:?}"
+        );
+        assert!(matches!(actual[0], LogMsg::SetStoreInfo(..)));
+        for t in &temporal {
+            assert!(
+                !actual.contains(t),
+                "a temporal frame leaked into the drop-temporal connect-history"
+            );
+        }
+        for s in &statics {
+            assert!(actual.contains(s), "a static frame was wrongly dropped");
+        }
+
+        completion.finish();
+    }
+
     #[tokio::test]
     async fn memory_limit_does_not_interrupt_stream() {
         let memory_limits = [
@@ -1844,6 +1956,7 @@ mod tests {
             playback_behavior: PlaybackBehavior::NewestFirst, // this is what we want to test
             memory_limit: MemoryLimit::UNLIMITED,
             cors_allowed_origins: vec![],
+            drop_temporal_history: false, // CERULION PATCH (CER-858)
         })
         .await;
         let mut client = make_client(addr).await;
