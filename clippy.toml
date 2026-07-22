@@ -1,0 +1,8 @@
+# CERULION PATCH (CER-858, F3): mirrors the ONE setting from rerun's workspace
+# clippy.toml (@ 4efb18f17f...) that the restored `[lints.clippy] unwrap_used =
+# "warn"` posture depends on. Without it, `unwrap_used` fires on every `.unwrap()`
+# in this crate's own `#[cfg(test)]` code (which cargo does NOT compile when the
+# crate is consumed as a dependency, so it was invisible pre-fork). With it,
+# `unwrap_used` still protects production code — the faithful upstream posture —
+# while exempting tests, exactly as the rerun workspace does.
+allow-unwrap-in-tests = true
