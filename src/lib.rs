@@ -11,9 +11,10 @@ use re_log_channel::{DataSourceMessage, DataSourceUiCommand};
 use re_log_encoding::{ToApplication as _, ToTransport as _};
 use re_log_types::TableMsg;
 use re_protos::common::v1alpha1::{
-    DataframePart as DataframePartProto, StoreKind as StoreKindProto, TableId as TableIdProto,
+    DataframePart as DataframePartProto, StoreId as StoreIdProto, StoreKind as StoreKindProto,
+    TableId as TableIdProto,
 };
-use re_protos::log_msg::v1alpha1::LogMsg as LogMsgProto;
+use re_protos::log_msg::v1alpha1::{ArrowMsg as ArrowMsgProto, LogMsg as LogMsgProto};
 use re_protos::sdk_comms::v1alpha1::{
     ReadMessagesRequest, ReadMessagesResponse, ReadTablesRequest, ReadTablesResponse,
     WriteMessagesRequest, WriteMessagesResponse, WriteTableRequest, WriteTableResponse,
@@ -80,8 +81,8 @@ pub struct ServerOptions {
     /// SCENE SKELETON with ZERO temporal replay, at ANY producer bandwidth
     /// (Cerulion Studio's instant-only live viz). Live subscribers still receive
     /// live temporal data via the broadcast; it is only the per-client REPLAY
-    /// buffer that drops it. Default `false` (stock re_grpc_server behavior). See
-    /// `vendor/re_grpc_server/CERULION-PATCH.md`.
+    /// buffer that drops it. Default `false` (stock `re_grpc_server` behavior).
+    /// See `CERULION-PATCH.md` at this crate's root.
     pub drop_temporal_history: bool,
 }
 
@@ -753,6 +754,24 @@ impl MsgQueue {
             None
         }
     }
+
+    /// CERULION PATCH (CER-858, F1/F2): retain only the messages for which `keep`
+    /// returns `true`, preserving relative order and keeping [`Self::size_bytes`]
+    /// exact. Used by the drop-temporal eviction paths (superseded blueprints and
+    /// entity-level static dedup) — both of which run under the flag, where the
+    /// stock `gc()` is OFF.
+    pub fn retain(&mut self, mut keep: impl FnMut(&LogOrTableMsgProto) -> bool) {
+        let mut removed_bytes = 0u64;
+        self.queue.retain(|msg| {
+            if keep(msg) {
+                true
+            } else {
+                removed_bytes += msg.total_size_bytes();
+                false
+            }
+        });
+        self.size_bytes -= removed_bytes;
+    }
 }
 
 // -----------------------------------------------------------------------------------
@@ -864,9 +883,29 @@ impl MessageBuffer {
         // in a separate queue that does *not* get garbage collected.
         use re_protos::log_msg::v1alpha1::log_msg::Msg;
         match inner {
-            // Store info, blueprint activation commands
-            Msg::SetStoreInfo(..) | Msg::BlueprintActivationCommand(..) => {
+            // Store info (recording or blueprint).
+            Msg::SetStoreInfo(..) => {
                 self.persistent.push_back(msg.into());
+            }
+
+            // Blueprint activation command.
+            Msg::BlueprintActivationCommand(cmd) => {
+                // CERULION PATCH (CER-858, F1): under `drop_temporal` the stock
+                // `gc()` is OFF, so `persistent` would grow forever under Studio
+                // `set_blueprint` churn — each layout change mints a FRESH
+                // blueprint store, and every new client would replay ALL
+                // superseded blueprints. Capture the just-activated blueprint id
+                // (before `msg` is moved), push the new activation, then evict
+                // every OTHER blueprint store's messages below.
+                let active = if self.drop_temporal {
+                    cmd.blueprint_id.clone()
+                } else {
+                    None
+                };
+                self.persistent.push_back(msg.into());
+                if let Some(active) = active {
+                    self.evict_superseded_blueprints(&active);
+                }
             }
 
             Msg::ArrowMsg(inner) => {
@@ -879,6 +918,22 @@ impl MessageBuffer {
                     // Persist blueprint messages forever.
                     self.persistent.push_back(msg.into());
                 } else if inner.is_static == Some(true) {
+                    // CERULION PATCH (CER-858, F2): under `drop_temporal`, dedup
+                    // statics entity-level (latest-wins, matching rerun's own
+                    // static semantics) so a reconnecting client re-logging the
+                    // same statics does not grow `static_` unboundedly (the stock
+                    // `gc()` that would otherwise cap it is OFF under the flag).
+                    // A decode failure yields `None` → plain append (never a
+                    // wrong-key drop).
+                    let new_key = if self.drop_temporal {
+                        Self::static_key_from_arrow(inner)
+                    } else {
+                        None
+                    };
+                    if let Some(new_key) = new_key {
+                        self.static_
+                            .retain(|m| Self::static_key_from_msg(m).as_ref() != Some(&new_key));
+                    }
                     self.static_.push_back(msg.into());
                 } else if !self.drop_temporal {
                     // Recording data (temporal). CERULION PATCH (CER-858): dropped
@@ -888,6 +943,74 @@ impl MessageBuffer {
                 }
             }
         }
+    }
+
+    /// CERULION PATCH (CER-858, F1): the store a persistent message belongs to
+    /// (`SetStoreInfo` → its store, `ArrowMsg` → its store, activation command →
+    /// its blueprint), or `None` for a message with no store attribution. Cheap:
+    /// reads proto fields only, no payload decode.
+    fn message_store_id(msg: &LogOrTableMsgProto) -> Option<&StoreIdProto> {
+        let LogOrTableMsgProto::LogMsg(log_msg) = msg else {
+            return None;
+        };
+        use re_protos::log_msg::v1alpha1::log_msg::Msg;
+        match log_msg.msg.as_ref()? {
+            Msg::SetStoreInfo(set) => set.info.as_ref()?.store_id.as_ref(),
+            Msg::ArrowMsg(arrow) => arrow.store_id.as_ref(),
+            Msg::BlueprintActivationCommand(cmd) => cmd.blueprint_id.as_ref(),
+        }
+    }
+
+    /// CERULION PATCH (CER-858, F1): evict every blueprint store OTHER than the
+    /// just-activated `active` from `persistent`, preserving relative order + exact
+    /// byte accounting. A recording-data `SetStoreInfo` is not blueprint-kind, so
+    /// it always survives; `active`'s own `SetStoreInfo` + chunks + the new
+    /// activation command (already pushed) all share `active`'s recording id, so
+    /// they survive too.
+    fn evict_superseded_blueprints(&mut self, active: &StoreIdProto) {
+        let keep_recording_id = &active.recording_id;
+        self.persistent
+            .retain(|msg| match Self::message_store_id(msg) {
+                Some(id) if id.kind() == StoreKindProto::Blueprint => {
+                    &id.recording_id == keep_recording_id
+                }
+                // Non-blueprint (recording `SetStoreInfo`) or unattributed: keep.
+                _ => true,
+            });
+    }
+
+    /// CERULION PATCH (CER-858, F2): the `(recording_id, entity_path)` a static
+    /// chunk belongs to, or `None` if it is not a static chunk or the entity path
+    /// cannot be extracted. Extraction requires decoding the arrow payload
+    /// (decompress + IPC schema) — done ONLY for the infrequent static path; a
+    /// decode failure returns `None` so the caller falls back to a plain append
+    /// (never a wrong-key drop).
+    fn static_key_from_arrow(arrow: &ArrowMsgProto) -> Option<(String, String)> {
+        if arrow.is_static != Some(true) {
+            return None;
+        }
+        let recording_id = arrow.store_id.as_ref()?.recording_id.clone();
+        let app = arrow.to_application(()).ok()?;
+        let entity_path = app
+            .batch
+            .schema_ref()
+            .metadata()
+            .get(re_sorbet::metadata::SORBET_ENTITY_PATH)?
+            .clone();
+        Some((recording_id, entity_path))
+    }
+
+    /// CERULION PATCH (CER-858, F2): [`Self::static_key_from_arrow`] for a buffered
+    /// message (used to find the prior static of the same entity to evict).
+    fn static_key_from_msg(msg: &LogOrTableMsgProto) -> Option<(String, String)> {
+        let LogOrTableMsgProto::LogMsg(log_msg) = msg else {
+            return None;
+        };
+        use re_protos::log_msg::v1alpha1::log_msg::Msg;
+        let Some(Msg::ArrowMsg(arrow)) = log_msg.msg.as_ref() else {
+            return None;
+        };
+        Self::static_key_from_arrow(arrow)
     }
 
     pub fn gc(&mut self, max_bytes: u64) {
@@ -1543,6 +1666,85 @@ mod tests {
         messages
     }
 
+    // CERULION PATCH (CER-858, F2): a single STATIC chunk for a NAMED entity path,
+    // so tests can exercise the entity-level static dedup (`generate_log_messages`
+    // hardcodes one entity, which would collapse under the dedup).
+    fn static_msg_for_entity(store_id: &StoreId, entity: &str) -> LogMsg {
+        LogMsg::ArrowMsg(
+            store_id.clone(),
+            re_chunk::Chunk::builder(entity)
+                .with_archetype(
+                    re_chunk::RowId::new(),
+                    re_log_types::TimePoint::STATIC,
+                    &re_sdk_types::archetypes::Points2D::new([(0.0, 0.0), (1.0, 1.0), (2.0, 2.0)]),
+                )
+                .build()
+                .unwrap()
+                .to_arrow_msg()
+                .unwrap(),
+        )
+    }
+
+    // CERULION PATCH (CER-858, F1): a full blueprint stream for an EXPLICIT store
+    // id (`SetStoreInfo` + `n_chunks` blueprint chunks + `BlueprintActivationCommand`),
+    // so tests can assert per-store which blueprint survived eviction.
+    fn blueprint_stream_for(store_id: &StoreId, n_chunks: usize) -> Vec<LogMsg> {
+        let mut messages = vec![set_store_info_msg(store_id)];
+        for _ in 0..n_chunks {
+            messages.push(LogMsg::ArrowMsg(
+                store_id.clone(),
+                re_chunk::Chunk::builder("test_entity")
+                    .with_archetype(
+                        re_chunk::RowId::new(),
+                        re_log_types::TimePoint::default().with(
+                            re_log_types::Timeline::new_sequence("blueprint"),
+                            re_log_types::TimeInt::from_millis(re_log_types::NonMinI64::MIN),
+                        ),
+                        &re_sdk_types::blueprint::archetypes::Background::new(
+                            re_sdk_types::blueprint::components::BackgroundKind::SolidColor,
+                        )
+                        .with_color([255, 0, 0]),
+                    )
+                    .build()
+                    .unwrap()
+                    .to_arrow_msg()
+                    .unwrap(),
+            ));
+        }
+        messages.push(LogMsg::BlueprintActivationCommand(
+            re_log_types::BlueprintActivationCommand {
+                blueprint_id: store_id.clone(),
+                make_active: true,
+                make_default: true,
+            },
+        ));
+        messages
+    }
+
+    // CERULION PATCH (CER-858, F1/F2): encode an application `LogMsg` into the
+    // transport proto the `MessageBuffer` actually stores (the exact production
+    // encode path — `to_transport(LZ4)` then `.into()`), for direct buffer-level
+    // unit tests.
+    fn proto_of(msg: &LogMsg) -> LogOrTableMsgProto {
+        use re_log_encoding::ToTransport as _;
+        LogOrTableMsgProto::LogMsg(
+            msg.to_transport(re_log_encoding::rrd::Compression::LZ4)
+                .expect("encode LogMsg to transport proto")
+                .into(),
+        )
+    }
+
+    // CERULION PATCH (CER-858, F2): the inner transport `Msg` (which derives
+    // `PartialEq`) of a buffered message, for byte-exact latest-wins assertions.
+    fn inner_proto_msg(msg: &LogOrTableMsgProto) -> re_protos::log_msg::v1alpha1::log_msg::Msg {
+        match msg {
+            LogOrTableMsgProto::LogMsg(log_msg) => {
+                log_msg.msg.clone().expect("log msg has an inner msg")
+            }
+            _ => panic!("expected a LogMsg variant"),
+        }
+    }
+
     async fn setup() -> (Completion, SocketAddr) {
         setup_opt(ServerOptions {
             playback_behavior: PlaybackBehavior::OldestFirst,
@@ -1847,7 +2049,13 @@ mod tests {
         let mut client = make_client(addr).await;
 
         let store_id = StoreId::random(StoreKind::Recording, "test_app");
-        let statics = generate_log_messages(&store_id, 2, Temporalness::Static);
+        // CERULION PATCH (CER-858, F2): two statics under DISTINCT entity paths so
+        // both survive the entity-level dedup (same-entity statics would collapse
+        // to one — that dedup is pinned by `drop_temporal_dedups_static_relog_per_entity`).
+        let statics = vec![
+            static_msg_for_entity(&store_id, "entity_a"),
+            static_msg_for_entity(&store_id, "entity_b"),
+        ];
         let temporal = generate_log_messages(&store_id, 3, Temporalness::Temporal);
         let mut messages = vec![set_store_info_msg(&store_id)];
         messages.extend(statics.clone());
@@ -1892,6 +2100,186 @@ mod tests {
         }
 
         completion.finish();
+    }
+
+    // CERULION PATCH (CER-858, F1): under `drop_temporal`, three sequential
+    // blueprint sends (each a FRESH blueprint store — the Studio `set_blueprint`
+    // churn shape) must leave `persistent` holding ONLY the last blueprint store's
+    // messages plus the recording data-store `SetStoreInfo`. The superseded
+    // blueprints are evicted (bounding growth, since `gc()` is OFF under the flag).
+    #[test]
+    fn drop_temporal_evicts_superseded_blueprint_stores() {
+        let mut buffer = MessageBuffer {
+            drop_temporal: true,
+            ..Default::default()
+        };
+
+        // A recording data store's SetStoreInfo must survive across blueprint churn.
+        let recording = StoreId::random(StoreKind::Recording, "test_app");
+        let data_info = set_store_info_msg(&recording);
+        buffer.add_msg(proto_of(&data_info));
+
+        // Three sequential blueprint sends, each a distinct blueprint store.
+        let b1 = StoreId::random(StoreKind::Blueprint, "test_app");
+        let b2 = StoreId::random(StoreKind::Blueprint, "test_app");
+        let b3 = StoreId::random(StoreKind::Blueprint, "test_app");
+        for id in [&b1, &b2] {
+            for m in blueprint_stream_for(id, 2) {
+                buffer.add_msg(proto_of(&m));
+            }
+        }
+        let bp3 = blueprint_stream_for(&b3, 2);
+        for m in &bp3 {
+            buffer.add_msg(proto_of(m));
+        }
+
+        // Hand oracle: persistent == [data SetStoreInfo] + the LAST blueprint's
+        // messages (SetStoreInfo + 2 chunks + activation), in order.
+        let expected_msgs: Vec<LogMsg> = std::iter::once(data_info.clone())
+            .chain(bp3.iter().cloned())
+            .collect();
+        let expected_protos: Vec<LogOrTableMsgProto> = expected_msgs.iter().map(proto_of).collect();
+
+        assert_eq!(
+            buffer.persistent.queue.len(),
+            expected_protos.len(),
+            "persistent must hold only the data SetStoreInfo + the LAST blueprint"
+        );
+        // Blueprints never land in static_/disposable.
+        assert_eq!(buffer.static_.queue.len(), 0);
+        assert_eq!(buffer.disposable.queue.len(), 0);
+
+        // Store-attribution oracle: bp1/bp2 fully evicted; only `recording` + b3.
+        let rec_id = |sid: &StoreId| -> String {
+            let proto: StoreIdProto = sid.clone().into();
+            proto.recording_id
+        };
+        let expected_ids: Vec<String> = std::iter::once(rec_id(&recording))
+            .chain(std::iter::repeat_n(rec_id(&b3), bp3.len()))
+            .collect();
+        let actual_ids: Vec<String> = buffer
+            .persistent
+            .iter()
+            .map(|m| {
+                MessageBuffer::message_store_id(m)
+                    .expect("persistent message has a store id")
+                    .recording_id
+                    .clone()
+            })
+            .collect();
+        assert_eq!(actual_ids, expected_ids, "wrong stores survived eviction");
+        assert!(
+            !actual_ids.contains(&rec_id(&b1)) && !actual_ids.contains(&rec_id(&b2)),
+            "a superseded blueprint store leaked into persistent"
+        );
+
+        // Hand-computed size_bytes: sum of the retained messages' encoded sizes.
+        let expected_bytes: u64 = expected_protos.iter().map(|m| m.total_size_bytes()).sum();
+        assert_eq!(
+            buffer.persistent.size_bytes, expected_bytes,
+            "persistent size_bytes must equal the retained messages' summed size"
+        );
+    }
+
+    // CERULION PATCH (CER-858, F1): eviction preserves the SURVIVING blueprint's
+    // activation ordering — `SetStoreInfo(B)` before B's chunks before B's
+    // `BlueprintActivationCommand`, in `all()` output — even after a PRIOR
+    // blueprint store is evicted.
+    #[test]
+    fn drop_temporal_blueprint_eviction_preserves_activation_ordering() {
+        use re_protos::log_msg::v1alpha1::log_msg::Msg;
+
+        let mut buffer = MessageBuffer {
+            drop_temporal: true,
+            ..Default::default()
+        };
+        let b1 = StoreId::random(StoreKind::Blueprint, "test_app");
+        let b2 = StoreId::random(StoreKind::Blueprint, "test_app");
+        for m in blueprint_stream_for(&b1, 2) {
+            buffer.add_msg(proto_of(&m));
+        }
+        for m in blueprint_stream_for(&b2, 2) {
+            buffer.add_msg(proto_of(&m));
+        }
+
+        let all = buffer.all(PlaybackBehavior::OldestFirst);
+        let b1_rec = {
+            let proto: StoreIdProto = b1.clone().into();
+            proto.recording_id
+        };
+        // No b1 message remains.
+        for msg in &all {
+            if let Some(id) = MessageBuffer::message_store_id(msg) {
+                assert_ne!(id.recording_id, b1_rec, "b1 was not evicted");
+            }
+        }
+
+        // Order: SetStoreInfo(b2), then the 2 chunks, then the activation.
+        let kinds: Vec<&'static str> = all
+            .iter()
+            .map(|m| match inner_proto_msg(m) {
+                Msg::SetStoreInfo(..) => "set_store_info",
+                Msg::ArrowMsg(..) => "arrow",
+                Msg::BlueprintActivationCommand(..) => "activation",
+            })
+            .collect();
+        assert_eq!(
+            kinds,
+            vec!["set_store_info", "arrow", "arrow", "activation"],
+            "surviving blueprint's activation ordering must be preserved"
+        );
+    }
+
+    // CERULION PATCH (CER-858, F2): under `drop_temporal`, re-logging a static for
+    // the SAME entity replaces the prior one (latest-wins), while statics for
+    // DIFFERENT entities are both retained. Bounds `static_` under reconnect
+    // re-logs (the stock `gc()` that would cap it is OFF under the flag).
+    #[test]
+    fn drop_temporal_dedups_static_relog_per_entity() {
+        let mut buffer = MessageBuffer {
+            drop_temporal: true,
+            ..Default::default()
+        };
+        let store = StoreId::random(StoreKind::Recording, "test_app");
+
+        // Same entity logged twice → only the latest is retained.
+        let first = static_msg_for_entity(&store, "robot/base");
+        let second = static_msg_for_entity(&store, "robot/base");
+        buffer.add_msg(proto_of(&first));
+        buffer.add_msg(proto_of(&second));
+        assert_eq!(
+            buffer.static_.queue.len(),
+            1,
+            "a same-entity static re-log must dedup to one chunk"
+        );
+
+        // The retained chunk is the LATEST (second), not the first.
+        let retained = buffer.static_.iter().next().unwrap();
+        assert_eq!(
+            inner_proto_msg(retained),
+            inner_proto_msg(&proto_of(&second)),
+            "the retained static must be the latest re-log"
+        );
+        assert_ne!(
+            inner_proto_msg(retained),
+            inner_proto_msg(&proto_of(&first)),
+            "the earlier static must have been evicted"
+        );
+        // size_bytes reflects only the one retained chunk.
+        assert_eq!(
+            buffer.static_.size_bytes,
+            proto_of(&second).total_size_bytes(),
+            "static_ size_bytes must reflect the single retained chunk"
+        );
+
+        // A static for a DIFFERENT entity is retained alongside.
+        let other = static_msg_for_entity(&store, "robot/arm");
+        buffer.add_msg(proto_of(&other));
+        assert_eq!(
+            buffer.static_.queue.len(),
+            2,
+            "statics for distinct entities must both be retained"
+        );
     }
 
     #[tokio::test]
