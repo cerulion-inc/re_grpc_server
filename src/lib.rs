@@ -1165,6 +1165,28 @@ struct EventLoop {
     /// never silent — and so a test can tell "the queue is small because frames
     /// were dropped" from "the queue is small because nothing was sent".
     live_dropped_bytes: u64,
+
+    /// CERULION PATCH (CER-959): bytes dropped in the CURRENT drop regime, or
+    /// `None` when not dropping.
+    ///
+    /// Drives the loud-once / suppressed-repeat / recovery cycle: a viewer that
+    /// falls behind gets ONE `warn!`, repeats are `debug!` carrying the running
+    /// total, and catching up emits one `info!` reporting what the regime cost —
+    /// then re-arms. Without this, a choppy stream is either silent at default
+    /// log levels or floods one line per dropped frame.
+    dropping_since: Option<u64>,
+}
+
+/// CERULION PATCH (CER-959): advance the drop-regime accumulator by `bytes`.
+///
+/// Returns the regime's running total and whether this drop OPENED the regime
+/// (i.e. is the one that gets the loud line). Pure, so the loud-once /
+/// suppressed-repeat policy is oracle-testable without a running server.
+fn advance_drop_regime(open_regime: Option<u64>, bytes: u64) -> (u64, bool) {
+    match open_regime {
+        Some(total) => (total.saturating_add(bytes), false),
+        None => (bytes, true),
+    }
 }
 
 /// CERULION PATCH (CER-959): is this message TEMPORAL (recording data on a
@@ -1218,6 +1240,7 @@ impl EventLoop {
             history,
             memory_snapshot,
             live_dropped_bytes: 0, // CERULION PATCH (CER-959)
+            dropping_since: None,  // CERULION PATCH (CER-959)
         }
     }
 
@@ -1267,14 +1290,12 @@ impl EventLoop {
         // play through. Persistent/static (the scene skeleton) are never
         // eligible; see `ServerOptions::live_temporal_budget_bytes`.
         if self.should_drop_live(&msg) {
-            self.live_dropped_bytes = self
-                .live_dropped_bytes
-                .saturating_add(msg.total_size_bytes());
-            re_log::debug_once!(
-                "Dropping live temporal data: a viewer is not keeping up and the live queue is over \
-                 its budget. The stream stays current instead of accumulating a backlog."
-            );
+            self.report_live_drop(msg.total_size_bytes());
             return;
+        }
+        // RECOVERY: a temporal message got through, so the viewer caught up.
+        if is_temporal(&msg) && self.dropping_since.is_some() {
+            self.report_live_recovery();
         }
 
         // This will block if the broadcast channel is full, applying back-pressure
@@ -1288,6 +1309,46 @@ impl EventLoop {
         self.gc_if_using_too_much_ram();
 
         self.history.add_msg(msg);
+    }
+
+    /// CERULION PATCH (CER-959): account for + report one dropped temporal
+    /// message, on the loud-once / suppressed-repeat cycle.
+    ///
+    /// A dropped frame must never be SILENT (an operator watching choppy video
+    /// has to be able to learn why) and must never FLOOD (this fires at frame
+    /// rate for as long as the viewer is behind). So the first drop of a regime
+    /// is one `warn!` and every repeat is a `debug!` carrying the running totals;
+    /// [`Self::report_live_recovery`] closes the regime and re-arms.
+    fn report_live_drop(&mut self, bytes: u64) {
+        self.live_dropped_bytes = self.live_dropped_bytes.saturating_add(bytes);
+        let (regime_total, first_of_regime) = advance_drop_regime(self.dropping_since, bytes);
+        self.dropping_since = Some(regime_total);
+        if first_of_regime {
+            re_log::warn!(
+                "Live viz is dropping frames: a viewer is not consuming as fast as this stream \
+                 produces, and the live queue is over its budget ({} bytes). Frames are dropped so \
+                 the viewer keeps showing the PRESENT instead of playing through a growing \
+                 backlog. The scene (blueprint, statics) is never dropped.",
+                self.options.live_temporal_budget_bytes.unwrap_or(0)
+            );
+        } else {
+            re_log::debug!(
+                "Live viz still dropping: {regime_total} bytes dropped this regime, {} total.",
+                self.live_dropped_bytes
+            );
+        }
+    }
+
+    /// CERULION PATCH (CER-959): close an open drop regime — report what it cost,
+    /// once, and re-arm so the next one is loud again.
+    fn report_live_recovery(&mut self) {
+        if let Some(dropped) = self.dropping_since.take() {
+            re_log::info!(
+                "Live viz recovered: the viewer is keeping up again ({dropped} bytes were dropped \
+                 while it was behind, {} total).",
+                self.live_dropped_bytes
+            );
+        }
     }
 
     /// CERULION PATCH (CER-959): is `msg` a TEMPORAL message arriving at a live
@@ -2216,6 +2277,49 @@ mod tests {
         }
 
         completion.finish();
+    }
+
+    // CERULION PATCH (CER-959): the loud-once / suppressed-repeat / recovery
+    // policy for dropped live frames, against a hand-written oracle. A dropped
+    // frame must never be SILENT (choppy video with no explanation) and never
+    // FLOOD (this fires at frame rate for as long as a viewer is behind), so the
+    // FIRST drop of each regime is loud and the rest are suppressed repeats
+    // carrying the running total.
+    #[test]
+    fn a_drop_regime_is_loud_once_then_accumulates_until_it_closes() {
+        // Regime 1: three drops. Only the first is loud; the total accumulates.
+        let (t1, loud1) = advance_drop_regime(None, 100);
+        assert_eq!(
+            (t1, loud1),
+            (100, true),
+            "the first drop opens the regime and is LOUD"
+        );
+        let (t2, loud2) = advance_drop_regime(Some(t1), 250);
+        assert_eq!(
+            (t2, loud2),
+            (350, false),
+            "a repeat is suppressed and accumulates"
+        );
+        let (t3, loud3) = advance_drop_regime(Some(t2), 50);
+        assert_eq!((t3, loud3), (400, false), "and keeps accumulating");
+
+        // Recovery CLOSES the regime (the caller `take()`s it), so the next drop
+        // is loud again and counts from zero — a viewer that flaps does not go
+        // silent after its first bad patch.
+        let (t4, loud4) = advance_drop_regime(None, 7);
+        assert_eq!(
+            (t4, loud4),
+            (7, true),
+            "after recovery re-arms the regime, the next drop is LOUD again"
+        );
+
+        // No overflow panic on a pathological total.
+        let (t5, loud5) = advance_drop_regime(Some(u64::MAX), 1);
+        assert_eq!(
+            (t5, loud5),
+            (u64::MAX, false),
+            "saturates rather than wrapping"
+        );
     }
 
     // CERULION PATCH (CER-959): `is_temporal` decides which messages the live

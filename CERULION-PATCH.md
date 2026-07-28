@@ -198,9 +198,29 @@ a further **temporal** message is DROPPED instead of awaited.
   blocks the loop.
 - **One message always fits.** The gate compares the budget against the CURRENT
   occupancy, so an empty queue accepts a message of any size.
-- **Never silent.** The running total of dropped bytes is reported as
-  `live_dropped` by `MessageProxyHandle::capture_memory`, beside `broadcast` /
-  `disposable` / `static` / `persistent`, plus a `debug_once!` breadcrumb.
+- **Never silent, never a flood.** A dropped frame must not leave an operator
+  staring at choppy video with no explanation, and must not emit a line per frame
+  for as long as a viewer is behind. So drops ride a loud-once regime cycle
+  mirroring `cerulion_core`'s `FailureRegimeLatch` (which cannot be imported
+  here): the FIRST drop of a regime is one `warn!` naming the cause and the
+  budget, repeats are `debug!` carrying the running totals, and the first
+  temporal message that gets through emits one `info!` reporting what the regime
+  cost and RE-ARMS — so a viewer that flaps does not go silent after its first
+  bad patch. The policy is a pure `advance_drop_regime` and is oracle-tested
+  (`a_drop_regime_is_loud_once_then_accumulates_until_it_closes`). The
+  unconditional running total is additionally reported as `live_dropped` by
+  `MessageProxyHandle::capture_memory`, beside `broadcast` / `disposable` /
+  `static` / `persistent`, so it survives log filtering.
+
+### Interaction with the replay history
+
+A dropped message returns BEFORE `MessageBuffer::add_msg`, so it does not enter
+the per-client replay history either. That is the intended reading — a frame not
+worth sending live is not worth replaying — and under vizd's configuration it is
+inert anyway, since `drop_temporal_history` already refuses temporal data. It is
+called out because a future user who sets a budget WITHOUT
+`drop_temporal_history` would otherwise be surprised that the live budget also
+thins their retained history.
 
 ### Residual
 
