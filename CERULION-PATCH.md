@@ -205,6 +205,33 @@ a further **temporal** message is DROPPED instead of awaited.
   loop — which also serves `Event::NewClient` — stalls. The gate keeps
   `LIVE_MESSAGE_RESERVE` (64) slots free on the message axis too, which is also
   what guarantees skeleton messages somewhere to go while temporal is being shed.
+- **Small messages are exempt from the BYTE axis** (`LIVE_SMALL_MESSAGE_FLOOR_BYTES`
+  = 8 KiB, `pub` so a host can pin its own message classes against it). The byte
+  comparison is against OCCUPANCY, not against the arriving message, so without a
+  floor a queue held over budget by a few megabyte-sized camera frames sheds EVERY
+  temporal message at any size — every plot sample, `/tf` update, `TextLog` line
+  and `Clear` sharing the one broadcast queue. That trade is wrong on both halves:
+  it saves the viewer well under a millisecond (MEASURED through the production
+  encode path: `Scalars` 1229 B, recursive `Clear` 1223 B, `TextLog` 1282 B,
+  `Transform3D` 1537 B, against 696_500 B for the smallest camera rendition and
+  2_779_467 B for 1280x720), and it can lose a message that never comes again — a
+  `rerun::Clear` is a one-shot STATE TRANSITION, so dropping it leaves a deleted
+  entity rendered for the rest of the session, converting a latency problem into a
+  persistently wrong picture. 8 KiB is 5.3x the largest control-class message and
+  85x below the smallest image-class one, so the band it separates is two orders
+  of magnitude wide. The MESSAGE axis is untouched (that is what prevents the
+  wedge), which also bounds the exemption: floor-admitted traffic can add at most
+  `(1024 - 64) * 8 KiB` = 7.5 MiB on top of the byte budget, and only if all 960
+  slots hold a message just under the floor. Oracle-tested on both sides and on
+  both axes (`the_small_message_floor_exempts_the_byte_axis_and_only_the_byte_axis`).
+- **A budget outside the usable band is reported, not clamped.** The byte axis can
+  only fire for `LIVE_SMALL_MESSAGE_FLOOR_BYTES < n < CHANNEL_SIZE_BYTES`: at or
+  below the floor nothing is ever over-budget-dropped, and at or above the
+  channel's own quota occupancy can never reach the budget (the sender awaits
+  first). Either way the option is accepted and then inert on that axis while the
+  server looks configured, so `MessageProxy::new` emits one `warn!` naming which
+  end was crossed. Clamping would hide the mistake. Pure classifier
+  (`live_budget_band_complaint`), oracle-tested on both thresholds.
 - **Dropping, not a smaller quota.** Shrinking either quota would make the event
   loop AWAIT sooner, with the same `Event::NewClient` consequence.
 - **One message always fits.** The gate compares the budget against the CURRENT
@@ -217,7 +244,7 @@ a further **temporal** message is DROPPED instead of awaited.
   budget, repeats are `debug!` carrying the running totals, and the first
   temporal message that gets through emits one `info!` reporting what the regime
   cost and RE-ARMS — so a viewer that flaps does not go silent after its first
-  bad patch. The policy is a pure `advance_drop_regime` and is oracle-tested
+  bad patch. The policy is the pure `decide_live` and is oracle-tested
   (`a_drop_regime_is_loud_once_then_accumulates_until_it_closes`). The
   unconditional running total is additionally reported as `live_dropped` by
   `MessageProxyHandle::capture_memory`, beside `broadcast` / `disposable` /
@@ -241,7 +268,27 @@ called out because a future user who sets a budget WITHOUT
 `drop_temporal_history` would otherwise be surprised that the live budget also
 thins their retained history.
 
-### Residual
+### Wiring coverage
+
+`the_live_budget_gate_is_wired_to_the_real_broadcast_queue` drives the REAL
+`EventLoop::handle_msg` with a budget actually set, over a real broadcast channel
+whose receiver is never drained. Every other `ServerOptions` in this crate's test
+module sets `live_temporal_budget_bytes: None`, so without that arm the suite
+never executed the gate, `live_occupancy()`, `report_live_drop` or the floor even
+once — a wiring regression (a swapped axis, a floor compared against the wrong
+quantity, a budget never threaded through) would have left it green while the pure
+`decide_live` oracles, which are handed a hand-written `LiveOccupancy`, all passed.
+
+### Residuals
+
+A `rerun::Clear` — or any other sub-floor one-shot — can still be dropped on the
+MESSAGE axis, i.e. when the queue is at `LIVE_MESSAGE_RESERVE` because ~960
+messages are already in flight. That axis is what keeps `send_async` from awaiting
+and the event loop from wedging, so nothing can be exempt from it; the alternative
+to dropping there is stalling `Event::NewClient`. The byte axis was the one that
+fires in the condition this patch exists for (a viewer behind on video), and the
+floor closes it. A per-stream budget is the real answer to both and is not what
+this ships.
 
 In the CER-906 *fallback* regime (no local H.264 decoder, so the VIEWER decodes and
 vizd forwards raw `VideoStream` samples) a dropped sample breaks the P-frame

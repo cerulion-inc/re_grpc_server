@@ -90,7 +90,7 @@ pub struct ServerOptions {
     /// holds more than `n` bytes, a further temporal message is DROPPED rather
     /// than awaited; `None` (the default) is stock behaviour.
     ///
-    /// This is a different buffer from [`Self::drop_temporal_history`]'s. That
+    /// This gates a different buffer from [`Self::drop_temporal_history`]'s. That
     /// one is the per-client REPLAY history (what a late joiner is sent on
     /// connect). This one is the LIVE path every already-connected viewer reads,
     /// which is byte-quota'd at `CHANNEL_SIZE_BYTES` (128 MiB) and **awaited**
@@ -107,9 +107,34 @@ pub struct ServerOptions {
     /// scene skeleton every viewer needs and always take the reliable awaiting
     /// path, so a busy live stream can never cost a client its scene.
     ///
+    /// **The drop is TOTAL, on both buffers.** A dropped message is not written
+    /// to the replay history either — the two buffers are separate, but a message
+    /// the live path judged not worth delivering NOW is not worth replaying to a
+    /// viewer that connects LATER, and writing it to history would grow a buffer
+    /// this option exists to keep bounded. So `capture_memory`'s `disposable`
+    /// under-reports what the writer produced by exactly `live_dropped`.
+    ///
     /// The budget must exceed the largest single message or that message could
     /// never cross; the drop compares against the CURRENT occupancy, so one
     /// message always fits an empty queue whatever its size.
+    ///
+    /// **Small messages are exempt from THIS axis.** A message under
+    /// [`LIVE_SMALL_MESSAGE_FLOOR_BYTES`] (8 KiB) is never dropped for the queue
+    /// being over budget: the comparison is against OCCUPANCY, so without the
+    /// floor a queue held over budget by megabyte-sized frames would shed every
+    /// kilobyte-sized plot sample, `/tf` update or `Clear` sharing it — saving the
+    /// viewer under a millisecond while permanently losing one-shot state
+    /// transitions. See that constant for the measured band and the worst-case
+    /// bound. The MESSAGE axis below still applies to small messages.
+    ///
+    /// **Sane band.** The budget is only meaningful for
+    /// `LIVE_SMALL_MESSAGE_FLOOR_BYTES < n < CHANNEL_SIZE_BYTES` (8 KiB ..
+    /// 128 MiB). At or below the floor nothing is ever over-budget-dropped; at or
+    /// above `CHANNEL_SIZE_BYTES` occupancy can never reach the budget (the
+    /// channel awaits first), so the byte axis silently never fires and only the
+    /// message axis remains. Both ends are warned about once at server start
+    /// rather than clamped — a budget outside the band is a configuration
+    /// mistake, and silently rewriting it would hide it.
     ///
     /// **The gate watches BOTH quotas, not just this one.** The channel is
     /// bounded by `CHANNEL_SIZE_BYTES` *and* `CHANNEL_SIZE_MESSAGES` (1024), and
@@ -1203,6 +1228,83 @@ struct EventLoop {
 /// still have somewhere to go while temporal traffic is being shed.
 const LIVE_MESSAGE_RESERVE: usize = 64;
 
+/// CERULION PATCH (CER-959): a message smaller than this is never dropped on the
+/// BYTE axis — it cannot be what pushed the queue over its byte budget.
+///
+/// [`ServerOptions::live_temporal_budget_bytes`] is compared against the queue's
+/// CURRENT OCCUPANCY, not against the arriving message. That is what bounds the
+/// backlog (a viewer is served the present, not a queue it must play through),
+/// but taken alone it makes the drop indiscriminate: while a few megabyte-sized
+/// camera frames hold occupancy over budget, EVERY temporal message is shed at
+/// any size, from any stream, because they all share one broadcast queue.
+///
+/// For image and point-cloud frames that is exactly right — the next frame
+/// supersedes the dropped one, so the viewer heals the moment it catches up. It
+/// is wrong for the kilobyte-scale traffic that shares the queue, on both halves
+/// of the trade:
+///
+/// - **It saves nothing.** Measured through the production encode path
+///   (`to_transport(LZ4)` → the proto the queue accounts): a `Scalars` sample is
+///   1229 B, a recursive `Clear` 1223 B, a `TextLog` line 1282 B, a `Transform3D`
+///   1537 B — against `696_500` B for the SMALLEST camera rendition (640x360
+///   RGB8) and `2_779_467` B for 1280x720. Shedding a 1.2 KB message off a queue holding
+///   megabytes buys the viewer well under a millisecond of catch-up.
+/// - **It can cost a message that never comes again.** A frame is a LATEST-VALUE
+///   sample; a small message often is not. A `rerun::Clear` is a one-shot STATE
+///   TRANSITION — drop it and the deleted entity stays rendered for the rest of
+///   the session, because nothing re-sends it and (under
+///   [`ServerOptions::drop_temporal_history`]) no replay history holds it. That
+///   converts a latency problem into a persistently WRONG picture, which is the
+///   one outcome strictly worse than the lag the budget removes.
+///
+/// **8 KiB — measured, not picked.** 5.3x the largest control-class message above
+/// and 85x below the smallest image-class one, so the band it separates is two
+/// orders of magnitude wide and nothing realistic sits in the gap. Point clouds
+/// cross it at ~1500 points (a 2000-point `Points3D` encodes to 9308 B), so the
+/// "no buffer for clouds" half of the ruling keeps holding for clouds of any
+/// consequence.
+///
+/// **This does NOT re-open the wedge, and it is bounded.** The MESSAGE axis is
+/// untouched: a flood of small messages is still dropped at
+/// [`LIVE_MESSAGE_RESERVE`], which is what keeps `send_async` from awaiting and
+/// the event loop (which also serves `Event::NewClient`) from stalling. So
+/// floor-admitted traffic can add at most
+/// `(CHANNEL_SIZE_MESSAGES - LIVE_MESSAGE_RESERVE) * LIVE_SMALL_MESSAGE_FLOOR_BYTES`
+/// = 960 x 8 KiB = 7.5 MiB on top of the byte budget — and only if EVERY one of
+/// those 960 slots holds a message just under the floor, which no real small-
+/// message stream produces (the classes above are ~1.2-1.5 KB, i.e. ~1.4 MiB for
+/// a full 960 slots).
+///
+/// A budget at or below this floor makes the byte axis inert; see
+/// [`ServerOptions::live_temporal_budget_bytes`], which warns about it at
+/// startup.
+pub const LIVE_SMALL_MESSAGE_FLOOR_BYTES: u64 = 8 * 1024;
+
+/// CERULION PATCH (CER-959): why a configured
+/// [`ServerOptions::live_temporal_budget_bytes`] cannot do what its setter meant,
+/// or `None` when it is inside the usable band.
+///
+/// The byte axis can only fire for
+/// `LIVE_SMALL_MESSAGE_FLOOR_BYTES < n < CHANNEL_SIZE_BYTES`. Outside it the
+/// option is accepted and then silently does nothing on that axis — the failure a
+/// caller is least able to see, since the field is set and the message axis still
+/// works, so the server looks configured. Pure, so the diagnostic is oracle-
+/// testable without a running server.
+fn live_budget_band_complaint(budget: Option<u64>) -> Option<&'static str> {
+    match budget {
+        Some(n) if n <= LIVE_SMALL_MESSAGE_FLOOR_BYTES => Some(
+            "it is at or below the small-message floor, so NO message is ever dropped for being \
+             over budget (only the message-count axis remains active)",
+        ),
+        Some(n) if CHANNEL_SIZE_BYTES <= n => Some(
+            "it is at or above the live channel's own byte quota, which the sender awaits at — so \
+             occupancy can never reach this budget and the byte axis never fires (only the \
+             message-count axis remains active)",
+        ),
+        None | Some(_) => None,
+    }
+}
+
 /// CERULION PATCH (CER-959): the live queue's occupancy on both quota axes.
 #[derive(Clone, Copy, Debug)]
 struct LiveOccupancy {
@@ -1239,6 +1341,17 @@ enum LiveDecision {
 /// `warn!` + an `info!` per oscillation, which at frame rate is the log-flood
 /// class the regime cycle exists to prevent. In the band between the two marks a
 /// message is admitted while the regime stays open: no drop, no log.
+///
+/// # Small-message floor
+///
+/// The BYTE axis compares the budget against the queue's OCCUPANCY, so on its own
+/// it would shed every temporal message at any size while a few camera frames
+/// hold the queue over budget. A message under
+/// [`LIVE_SMALL_MESSAGE_FLOOR_BYTES`] is therefore exempt from that axis: it
+/// cannot be what pushed the queue over, dropping it saves the viewer nothing
+/// measurable, and it may be a one-shot state transition that never comes again.
+/// The MESSAGE axis still applies to it — that is what bounds a small-message
+/// flood and keeps the event loop unblocked.
 fn decide_live(
     budget: Option<u64>,
     occ: LiveOccupancy,
@@ -1255,7 +1368,10 @@ fn decide_live(
         };
     };
 
-    let over_bytes = budget < occ.bytes;
+    // The BYTE axis skips messages under the floor — see the fn docs. The MESSAGE
+    // axis deliberately does not: it is what keeps the loop from wedging, and a
+    // flood of small messages is exactly what would wedge it.
+    let over_bytes = LIVE_SMALL_MESSAGE_FLOOR_BYTES <= msg_bytes && budget < occ.bytes;
     let over_messages = occ.max_messages <= occ.messages.saturating_add(LIVE_MESSAGE_RESERVE);
     if over_bytes || over_messages {
         return match open_regime {
@@ -1552,6 +1668,18 @@ impl MessageProxy {
     fn new_with_recv(
         options: ServerOptions,
     ) -> (Self, async_broadcast_channel::Receiver<LogOrTableMsgProto>) {
+        // CERULION PATCH (CER-959): a budget outside the usable band is accepted
+        // and then inert on the byte axis. Say so once, at start, rather than
+        // clamping it — a silent rewrite would hide the mistake.
+        if let Some(why) = live_budget_band_complaint(options.live_temporal_budget_bytes) {
+            re_log::warn!(
+                "live_temporal_budget_bytes={} is outside the usable band ({} < n < {}): {why}.",
+                options.live_temporal_budget_bytes.unwrap_or(0),
+                LIVE_SMALL_MESSAGE_FLOOR_BYTES,
+                CHANNEL_SIZE_BYTES,
+            );
+        }
+
         let (broadcast_log_tx, broadcast_log_rx) = async_broadcast_channel::channel(
             "re_grpc_server broadcast",
             CHANNEL_SIZE_MESSAGES,
@@ -2019,6 +2147,35 @@ mod tests {
         messages
     }
 
+    // CERULION PATCH (CER-959): a TEMPORAL chunk on a timeline, sized by its
+    // point count, so a test can straddle `LIVE_SMALL_MESSAGE_FLOOR_BYTES` with
+    // real archetypes rather than synthetic byte counts. MEASURED encoded sizes
+    // (`to_transport(LZ4)` → the proto the queue accounts): 1 point ≈ 1.2 KB
+    // (chunk schema overhead dominates), 2000 points = 9308 B.
+    fn temporal_points_msg(store_id: &StoreId, entity: &str, seq: i64, points: usize) -> LogMsg {
+        let tp = re_log_types::TimePoint::default().with(
+            re_log_types::Timeline::new_sequence("frame"),
+            re_log_types::TimeInt::new_temporal(seq),
+        );
+        LogMsg::ArrowMsg(
+            store_id.clone(),
+            re_chunk::Chunk::builder(entity)
+                .with_archetype(
+                    RowId::new(),
+                    tp,
+                    &re_sdk_types::archetypes::Points3D::new(
+                        (0..points)
+                            .map(|i| (i as f32, 0.0, 0.0))
+                            .collect::<Vec<_>>(),
+                    ),
+                )
+                .build()
+                .unwrap()
+                .to_arrow_msg()
+                .unwrap(),
+        )
+    }
+
     // CERULION PATCH (CER-858, F1/F2): encode an application `LogMsg` into the
     // transport proto the `MessageBuffer` actually stores (the exact production
     // encode path — `to_transport(LZ4)` then `.into()`), for direct buffer-level
@@ -2420,31 +2577,53 @@ mod tests {
 
     const BUDGET: u64 = 8 * 1024 * 1024;
 
+    /// MEASURED encoded sizes of the two camera renditions a Cerulion attach
+    /// interleaves, through the production encode path (`to_transport(LZ4)` → the
+    /// proto the queue accounts). Both are far above
+    /// [`LIVE_SMALL_MESSAGE_FLOOR_BYTES`], which is what makes them eligible for
+    /// the byte axis at all — the drop-regime arms below use real frame sizes so
+    /// the vectors describe traffic the gate is actually for.
+    const FRAME_1280X720: u64 = 2_779_467;
+    const FRAME_640X360: u64 = 696_500;
+
     #[test]
     fn a_drop_regime_is_loud_once_then_accumulates_until_it_closes() {
         // Regime 1: two drops. Only the first is loud; the total accumulates.
         assert_eq!(
-            decide_live(Some(BUDGET), occ(BUDGET + 1, 4), true, 100, None),
+            decide_live(Some(BUDGET), occ(BUDGET + 1, 4), true, FRAME_640X360, None),
             LiveDecision::Drop {
-                regime_total: 100,
+                regime_total: FRAME_640X360,
                 loud: true
             },
             "the first drop opens the regime and is LOUD"
         );
         assert_eq!(
-            decide_live(Some(BUDGET), occ(BUDGET + 1, 4), true, 250, Some(100)),
+            decide_live(
+                Some(BUDGET),
+                occ(BUDGET + 1, 4),
+                true,
+                FRAME_1280X720,
+                Some(FRAME_640X360)
+            ),
             LiveDecision::Drop {
-                regime_total: 350,
+                regime_total: FRAME_640X360 + FRAME_1280X720,
                 loud: false
             },
             "a repeat is suppressed and accumulates"
         );
+        let regime = FRAME_640X360 + FRAME_1280X720;
 
         // HYSTERESIS: back under budget but ABOVE the low-water mark => admitted,
         // regime stays OPEN, nothing logged. Without this a viewer sitting at the
         // boundary pays a warn! + an info! per oscillation, at frame rate.
         assert_eq!(
-            decide_live(Some(BUDGET), occ(BUDGET - 1, 4), true, 100, Some(350)),
+            decide_live(
+                Some(BUDGET),
+                occ(BUDGET - 1, 4),
+                true,
+                FRAME_1280X720,
+                Some(regime)
+            ),
             LiveDecision::Admit {
                 closes_regime: None
             },
@@ -2453,9 +2632,15 @@ mod tests {
 
         // Comfortably drained => the regime CLOSES, reporting what it cost.
         assert_eq!(
-            decide_live(Some(BUDGET), occ(BUDGET / 4, 4), true, 100, Some(350)),
+            decide_live(
+                Some(BUDGET),
+                occ(BUDGET / 4, 4),
+                true,
+                FRAME_1280X720,
+                Some(regime)
+            ),
             LiveDecision::Admit {
-                closes_regime: Some(350)
+                closes_regime: Some(regime)
             },
             "past the low-water mark the regime closes and reports its total"
         );
@@ -2465,9 +2650,9 @@ mod tests {
         // patch — a regime that never closes turns every later incident into a
         // suppressed debug!.
         assert_eq!(
-            decide_live(Some(BUDGET), occ(BUDGET + 1, 4), true, 7, None),
+            decide_live(Some(BUDGET), occ(BUDGET + 1, 4), true, FRAME_640X360, None),
             LiveDecision::Drop {
-                regime_total: 7,
+                regime_total: FRAME_640X360,
                 loud: true
             },
             "after recovery, the next drop is LOUD again"
@@ -2475,7 +2660,13 @@ mod tests {
 
         // Saturates rather than wrapping.
         assert_eq!(
-            decide_live(Some(BUDGET), occ(BUDGET + 1, 4), true, 1, Some(u64::MAX)),
+            decide_live(
+                Some(BUDGET),
+                occ(BUDGET + 1, 4),
+                true,
+                FRAME_1280X720,
+                Some(u64::MAX)
+            ),
             LiveDecision::Drop {
                 regime_total: u64::MAX,
                 loud: false
@@ -2547,6 +2738,247 @@ mod tests {
                 closes_regime: None
             },
             "with no budget the gate is inert (stock re_grpc_server)"
+        );
+    }
+
+    /// WIRING — the gate driven through the REAL [`EventLoop::handle_msg`] with a
+    /// budget actually set, over a real broadcast channel whose receiver is never
+    /// drained (the slowest possible viewer).
+    ///
+    /// Every other `ServerOptions` in this file sets `live_temporal_budget_bytes:
+    /// None`, so before this arm the fork's own suite never executed the gate,
+    /// `live_occupancy()`, `report_live_drop` or the floor even once — its whole
+    /// CER-959 coverage was the pure `decide_live` oracles, which are handed a
+    /// hand-written `LiveOccupancy` instead of reading the live channel. A wiring
+    /// regression (a swapped axis, a floor compared against the wrong quantity, a
+    /// budget never threaded through) left the suite green.
+    #[tokio::test]
+    async fn the_live_budget_gate_is_wired_to_the_real_broadcast_queue() {
+        // A budget inside the usable band, small enough that a handful of
+        // 2000-point clouds (9308 B each, measured) crosses it.
+        const SMALL_BUDGET: u64 = 16 * 1024;
+
+        let (broadcast_tx, _broadcast_rx) = async_broadcast_channel::channel(
+            "cer959 wiring test",
+            CHANNEL_SIZE_MESSAGES,
+            CHANNEL_SIZE_BYTES,
+        );
+        // `_broadcast_rx` is held and NEVER drained: that is what makes occupancy
+        // accumulate. Dropping it would make every send fail `NoReceivers`.
+        let (_event_tx, event_rx) = async_mpsc_channel::channel("cer959 wiring events", 32);
+        let mut loop_ = EventLoop::new(
+            ServerOptions {
+                playback_behavior: PlaybackBehavior::OldestFirst,
+                memory_limit: MemoryLimit::ZERO,
+                cors_allowed_origins: vec![],
+                drop_temporal_history: true,
+                live_temporal_budget_bytes: Some(SMALL_BUDGET),
+            },
+            event_rx,
+            broadcast_tx,
+            Default::default(),
+        );
+
+        let store = StoreId::random(StoreKind::Recording, "cer959wire");
+        loop_
+            .handle_msg(proto_of(&set_store_info_msg(&store)))
+            .await;
+
+        // Drive the queue over budget with CLOUD-class messages (above the floor).
+        let cloud = |seq: i64| proto_of(&temporal_points_msg(&store, "cloud", seq, 2000));
+        let mut seq = 0;
+        while loop_.live_occupancy().bytes <= SMALL_BUDGET {
+            loop_.handle_msg(cloud(seq)).await;
+            seq += 1;
+            assert!(seq < 64, "the queue should be over budget long before this");
+        }
+        assert_eq!(
+            loop_.live_dropped_bytes, 0,
+            "nothing may be dropped while the queue was still WITHIN budget"
+        );
+
+        // Now over budget: another cloud is dropped. Its size is read off the
+        // message that is actually handed over — the encoded size varies by a few
+        // bytes with the row id, so a separately-built twin is not the same number.
+        let dropped = cloud(seq);
+        let cloud_bytes = dropped.total_size_bytes();
+        assert!(
+            LIVE_SMALL_MESSAGE_FLOOR_BYTES <= cloud_bytes,
+            "precondition: the cloud message must be at or above the floor, else this arm would \
+             prove nothing about the byte axis. Got {cloud_bytes}"
+        );
+        loop_.handle_msg(dropped).await;
+        assert_eq!(
+            loop_.live_dropped_bytes, cloud_bytes,
+            "an over-floor temporal message arriving at an over-budget queue must be dropped, and \
+             counted"
+        );
+
+        // ...while a SMALL message still crosses (the floor), and a STATIC one too
+        // (the skeleton exemption) — both through the production call site.
+        let before = loop_.live_occupancy().bytes;
+        let small = proto_of(&temporal_points_msg(&store, "plot", 1, 1));
+        let small_bytes = small.total_size_bytes();
+        assert!(
+            small_bytes < LIVE_SMALL_MESSAGE_FLOOR_BYTES,
+            "precondition: the plot message must be under the floor. Got {small_bytes}"
+        );
+        loop_.handle_msg(small).await;
+        assert_eq!(
+            loop_.live_dropped_bytes, cloud_bytes,
+            "a SUB-FLOOR temporal message must still cross an over-budget queue — nothing further \
+             may be counted as dropped"
+        );
+        assert_eq!(
+            loop_.live_occupancy().bytes,
+            before + small_bytes,
+            "and it must really be in the live queue, not merely uncounted"
+        );
+
+        let before = loop_.live_occupancy().bytes;
+        // A BIG static (a robot mesh / a static point cloud is the real shape), so
+        // that its delivery is explained by the skeleton exemption and not by the
+        // small-message floor. `static_msg_for_entity`'s 3-point chunk is 1175 B,
+        // i.e. under the floor, which would make this arm ambiguous.
+        let stat = proto_of(&LogMsg::ArrowMsg(
+            store.clone(),
+            re_chunk::Chunk::builder("scene/model")
+                .with_archetype(
+                    RowId::new(),
+                    re_log_types::TimePoint::STATIC,
+                    &re_sdk_types::archetypes::Points3D::new(
+                        (0..2000).map(|i| (i as f32, 0.0, 0.0)).collect::<Vec<_>>(),
+                    ),
+                )
+                .build()
+                .unwrap()
+                .to_arrow_msg()
+                .unwrap(),
+        ));
+        let static_bytes = stat.total_size_bytes();
+        assert!(
+            LIVE_SMALL_MESSAGE_FLOOR_BYTES <= static_bytes,
+            "precondition: the static must be at or ABOVE the floor, else its delivery would be \
+             explained by the floor rather than by the skeleton exemption. Got {static_bytes}"
+        );
+        loop_.handle_msg(stat).await;
+        assert_eq!(
+            loop_.live_dropped_bytes, cloud_bytes,
+            "the scene skeleton is never eligible for the drop, at any size"
+        );
+        assert_eq!(
+            loop_.live_occupancy().bytes,
+            before + static_bytes,
+            "and the static must really be in the live queue"
+        );
+    }
+
+    /// The SMALL-MESSAGE FLOOR, on both sides and on both axes.
+    ///
+    /// The byte axis compares the budget against OCCUPANCY, so without a floor a
+    /// queue held over budget by megabyte-sized camera frames sheds every
+    /// kilobyte-sized plot sample, `/tf` update and `Clear` sharing it — saving
+    /// the viewer nothing measurable while permanently losing one-shot state
+    /// transitions. The floor exempts those from THAT axis only.
+    #[test]
+    fn the_small_message_floor_exempts_the_byte_axis_and_only_the_byte_axis() {
+        // Hopelessly over the BYTE budget, nowhere near the message reserve.
+        let over_bytes = occ(BUDGET * 4, 4);
+
+        assert_eq!(
+            decide_live(
+                Some(BUDGET),
+                over_bytes,
+                true,
+                LIVE_SMALL_MESSAGE_FLOOR_BYTES - 1,
+                None
+            ),
+            LiveDecision::Admit {
+                closes_regime: None
+            },
+            "a message under the floor is never dropped for the QUEUE being over budget — it \
+             cannot be what pushed it over, and it may be a one-shot state transition (a `Clear`) \
+             that never comes again"
+        );
+        assert_eq!(
+            decide_live(
+                Some(BUDGET),
+                over_bytes,
+                true,
+                LIVE_SMALL_MESSAGE_FLOOR_BYTES,
+                None
+            ),
+            LiveDecision::Drop {
+                regime_total: LIVE_SMALL_MESSAGE_FLOOR_BYTES,
+                loud: true
+            },
+            "AT the floor the byte axis bites — a threshold, not a taper"
+        );
+        assert_eq!(
+            decide_live(Some(BUDGET), over_bytes, true, 2_779_467, None),
+            LiveDecision::Drop {
+                regime_total: 2_779_467,
+                loud: true
+            },
+            "an image-class frame (1280x720 RGB8, measured encoded size) is still dropped — the \
+             floor must not have disarmed the axis this budget exists for"
+        );
+
+        // The floor is BYTE-axis only. The message axis is what keeps `send_async`
+        // from awaiting and the event loop (which serves `Event::NewClient`) from
+        // wedging, so a flood of small messages must still be shed.
+        let at_reserve = occ(4096, CHANNEL_SIZE_MESSAGES - LIVE_MESSAGE_RESERVE);
+        assert_eq!(
+            decide_live(Some(BUDGET), at_reserve, true, 1229, None),
+            LiveDecision::Drop {
+                regime_total: 1229,
+                loud: true
+            },
+            "at the MESSAGE reserve even a sub-floor message is dropped — exempting it there \
+             would re-open the wedge the reserve exists to prevent"
+        );
+
+        // A floor-admitted message must not be read as evidence the viewer caught
+        // up: the queue it crossed is still over budget.
+        assert_eq!(
+            decide_live(Some(BUDGET), over_bytes, true, 1229, Some(500)),
+            LiveDecision::Admit {
+                closes_regime: None
+            },
+            "a small message crossing an over-budget queue does NOT close the regime"
+        );
+    }
+
+    /// The usable band for a configured budget. Outside it the option is accepted
+    /// and then inert on the byte axis — the failure a caller is least able to
+    /// see, since the field is set and the message axis still works.
+    #[test]
+    fn a_budget_outside_the_usable_band_is_reported() {
+        assert_eq!(
+            live_budget_band_complaint(None),
+            None,
+            "no budget, no complaint"
+        );
+        assert_eq!(
+            live_budget_band_complaint(Some(BUDGET)),
+            None,
+            "a budget inside the band is fine"
+        );
+        assert!(
+            live_budget_band_complaint(Some(LIVE_SMALL_MESSAGE_FLOOR_BYTES)).is_some(),
+            "AT the floor nothing can ever be dropped for bytes"
+        );
+        assert!(
+            live_budget_band_complaint(Some(LIVE_SMALL_MESSAGE_FLOOR_BYTES + 1)).is_none(),
+            "one byte above the floor is usable — a threshold, not a taper"
+        );
+        assert!(
+            live_budget_band_complaint(Some(CHANNEL_SIZE_BYTES)).is_some(),
+            "AT the channel's own quota the occupancy can never reach the budget"
+        );
+        assert!(
+            live_budget_band_complaint(Some(CHANNEL_SIZE_BYTES - 1)).is_none(),
+            "one byte below the channel quota is (barely) usable"
         );
     }
 
