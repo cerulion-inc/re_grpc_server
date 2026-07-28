@@ -1305,6 +1305,29 @@ fn live_budget_band_complaint(budget: Option<u64>) -> Option<&'static str> {
     }
 }
 
+/// CERULION PATCH (CER-959): what the LIVE queue ACCOUNTS for one message — the
+/// exact quantity [`ServerOptions::live_temporal_budget_bytes`] and
+/// [`LIVE_SMALL_MESSAGE_FLOOR_BYTES`] are compared against.
+///
+/// A host carries two documented sizing obligations it otherwise has no way to
+/// check: the budget must exceed its largest single message, and it may need to
+/// know which of its own message classes fall under the floor. Both are about the
+/// ENCODED, compressed proto the queue holds, which is not the payload the host
+/// built — for a raw image the encoded message measures ~0.5% LARGER, and for a
+/// one-row chunk the schema overhead is most of it (a 1-value `Scalars` sample
+/// encodes to ~1.2 KB).
+///
+/// Returns `None` if the message cannot be encoded, which is the same condition
+/// under which the server would fail to transport it. This performs the full
+/// encode, so it is a sizing/diagnostic call — not something to run per message.
+pub fn live_queue_size_bytes(msg: &re_log_types::LogMsg) -> Option<u64> {
+    let proto: LogMsgProto = msg
+        .to_transport(re_log_encoding::rrd::Compression::LZ4)
+        .ok()?
+        .into();
+    Some(LogOrTableMsgProto::LogMsg(proto).total_size_bytes())
+}
+
 /// CERULION PATCH (CER-959): the live queue's occupancy on both quota axes.
 #[derive(Clone, Copy, Debug)]
 struct LiveOccupancy {
@@ -2800,8 +2823,18 @@ mod tests {
         // Now over budget: another cloud is dropped. Its size is read off the
         // message that is actually handed over — the encoded size varies by a few
         // bytes with the row id, so a separately-built twin is not the same number.
-        let dropped = cloud(seq);
+        let dropped_log = temporal_points_msg(&store, "cloud", seq, 2000);
+        // The public sizing helper must report EXACTLY what the queue accounts,
+        // because a host uses it to check its own classes against the floor and
+        // the budget. Tying it to the production accounting here (rather than to
+        // its own encode) is what makes it a pin rather than a restatement.
+        let advertised = live_queue_size_bytes(&dropped_log).expect("the message encodes");
+        let dropped = proto_of(&dropped_log);
         let cloud_bytes = dropped.total_size_bytes();
+        assert_eq!(
+            advertised, cloud_bytes,
+            "live_queue_size_bytes must report the same number the live queue accounts"
+        );
         assert!(
             LIVE_SMALL_MESSAGE_FLOOR_BYTES <= cloud_bytes,
             "precondition: the cloud message must be at or above the floor, else this arm would \

@@ -224,6 +224,16 @@ a further **temporal** message is DROPPED instead of awaited.
   `(1024 - 64) * 8 KiB` = 7.5 MiB on top of the byte budget, and only if all 960
   slots hold a message just under the floor. Oracle-tested on both sides and on
   both axes (`the_small_message_floor_exempts_the_byte_axis_and_only_the_byte_axis`).
+- **`live_queue_size_bytes(&LogMsg) -> Option<u64>`** reports what the live queue
+  ACCOUNTS for one message — the exact quantity both the budget and the floor are
+  compared against. A host has two documented sizing obligations (the budget must
+  exceed its largest single message; it may need to know which of its classes sit
+  under the floor) and no other way to check them, because the number is the
+  ENCODED compressed proto, not the payload it built: a raw image measures ~0.5%
+  LARGER encoded, and a one-row chunk is mostly schema overhead (a 1-value
+  `Scalars` sample is ~1.2 KB). Pinned against the server's OWN accounting inside
+  `the_live_budget_gate_is_wired_to_the_real_broadcast_queue`, not against its own
+  encode.
 - **A budget outside the usable band is reported, not clamped.** The byte axis can
   only fire for `LIVE_SMALL_MESSAGE_FLOOR_BYTES < n < CHANNEL_SIZE_BYTES`: at or
   below the floor nothing is ever over-budget-dropped, and at or above the
