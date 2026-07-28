@@ -1260,9 +1260,10 @@ const LIVE_MESSAGE_RESERVE: usize = 64;
 /// **8 KiB — measured, not picked.** 5.3x the largest control-class message above
 /// and 85x below the smallest image-class one, so the band it separates is two
 /// orders of magnitude wide and nothing realistic sits in the gap. Point clouds
-/// cross it at ~1500 points (a 2000-point `Points3D` encodes to 9308 B), so the
-/// "no buffer for clouds" half of the ruling keeps holding for clouds of any
-/// consequence.
+/// cross it at **~1700 points**: `Points3D` measures 3288 B at 500 points, 5300 B
+/// at 1000 and 9308 B at 2000, i.e. ~4.0 B/point over a ~1.28 KB chunk floor, so
+/// 8 KiB lands at `(8192 - 1278) / 4.01`. The "no buffer for clouds" half of the
+/// ruling therefore keeps holding for clouds of any consequence.
 ///
 /// **This does NOT re-open the wedge, and it is bounded.** The MESSAGE axis is
 /// untouched: a flood of small messages is still dropped at
