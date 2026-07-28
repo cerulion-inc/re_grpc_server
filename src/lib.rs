@@ -2775,19 +2775,26 @@ mod tests {
     /// hand-written `LiveOccupancy` instead of reading the live channel. A wiring
     /// regression (a swapped axis, a floor compared against the wrong quantity, a
     /// budget never threaded through) left the suite green.
-    #[tokio::test]
-    async fn the_live_budget_gate_is_wired_to_the_real_broadcast_queue() {
-        // A budget inside the usable band, small enough that a handful of
-        // 2000-point clouds (9308 B each, measured) crosses it.
-        const SMALL_BUDGET: u64 = 16 * 1024;
+    /// A budget inside the usable band, small enough that a handful of 2000-point
+    /// clouds (9308 B each, measured) crosses it.
+    const WIRING_BUDGET: u64 = 16 * 1024;
 
-        let (broadcast_tx, _broadcast_rx) = async_broadcast_channel::channel(
+    /// A REAL [`EventLoop`] with a budget set, over a real broadcast channel whose
+    /// receiver is held and NEVER drained, driven until its live queue is over
+    /// budget. Returns the loop, its store, the next unused sequence and the
+    /// never-drained receiver (which must be kept alive: dropping it would make
+    /// every send fail `NoReceivers`).
+    async fn over_budget_event_loop() -> (
+        EventLoop,
+        StoreId,
+        i64,
+        async_broadcast_channel::Receiver<LogOrTableMsgProto>,
+    ) {
+        let (broadcast_tx, broadcast_rx) = async_broadcast_channel::channel(
             "cer959 wiring test",
             CHANNEL_SIZE_MESSAGES,
             CHANNEL_SIZE_BYTES,
         );
-        // `_broadcast_rx` is held and NEVER drained: that is what makes occupancy
-        // accumulate. Dropping it would make every send fail `NoReceivers`.
         let (_event_tx, event_rx) = async_mpsc_channel::channel("cer959 wiring events", 32);
         let mut loop_ = EventLoop::new(
             ServerOptions {
@@ -2795,7 +2802,7 @@ mod tests {
                 memory_limit: MemoryLimit::ZERO,
                 cors_allowed_origins: vec![],
                 drop_temporal_history: true,
-                live_temporal_budget_bytes: Some(SMALL_BUDGET),
+                live_temporal_budget_bytes: Some(WIRING_BUDGET),
             },
             event_rx,
             broadcast_tx,
@@ -2808,10 +2815,11 @@ mod tests {
             .await;
 
         // Drive the queue over budget with CLOUD-class messages (above the floor).
-        let cloud = |seq: i64| proto_of(&temporal_points_msg(&store, "cloud", seq, 2000));
         let mut seq = 0;
-        while loop_.live_occupancy().bytes <= SMALL_BUDGET {
-            loop_.handle_msg(cloud(seq)).await;
+        while loop_.live_occupancy().bytes <= WIRING_BUDGET {
+            loop_
+                .handle_msg(proto_of(&temporal_points_msg(&store, "cloud", seq, 2000)))
+                .await;
             seq += 1;
             assert!(seq < 64, "the queue should be over budget long before this");
         }
@@ -2819,8 +2827,14 @@ mod tests {
             loop_.live_dropped_bytes, 0,
             "nothing may be dropped while the queue was still WITHIN budget"
         );
+        (loop_, store, seq, broadcast_rx)
+    }
 
-        // Now over budget: another cloud is dropped. Its size is read off the
+    #[tokio::test]
+    async fn the_live_budget_gate_is_wired_to_the_real_broadcast_queue() {
+        let (mut loop_, store, seq, _rx) = over_budget_event_loop().await;
+
+        // Over budget: a cloud is dropped. Its size is read off the
         // message that is actually handed over — the encoded size varies by a few
         // bytes with the row id, so a separately-built twin is not the same number.
         let dropped_log = temporal_points_msg(&store, "cloud", seq, 2000);
@@ -2846,9 +2860,23 @@ mod tests {
             "an over-floor temporal message arriving at an over-budget queue must be dropped, and \
              counted"
         );
+    }
 
-        // ...while a SMALL message still crosses (the floor), and a STATIC one too
-        // (the skeleton exemption) — both through the production call site.
+    /// The two EXEMPTIONS at the production call site: a sub-floor message and the
+    /// scene skeleton both cross an over-budget queue. Split from the arm above
+    /// only because one body exceeded the crate's `too_many_lines` lint; it shares
+    /// that arm's setup and its reason for existing.
+    #[tokio::test]
+    async fn the_floor_and_the_skeleton_exemption_are_wired_at_the_call_site() {
+        let (mut loop_, store, seq, _rx) = over_budget_event_loop().await;
+        // Establish the drop regime first, so the assertions below distinguish
+        // "not dropped" from "nothing was ever dropped".
+        let dropped = proto_of(&temporal_points_msg(&store, "cloud", seq, 2000));
+        let cloud_bytes = dropped.total_size_bytes();
+        loop_.handle_msg(dropped).await;
+        assert_eq!(loop_.live_dropped_bytes, cloud_bytes);
+
+        // A SMALL message still crosses (the floor)...
         let before = loop_.live_occupancy().bytes;
         let small = proto_of(&temporal_points_msg(&store, "plot", 1, 1));
         let small_bytes = small.total_size_bytes();
