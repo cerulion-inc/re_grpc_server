@@ -1,4 +1,4 @@
-# CERULION fork of `re_grpc_server` 0.34.1 — CER-858
+# CERULION fork of `re_grpc_server` 0.34.1 — CER-858 + CER-959
 
 This repository (`cerulion-inc/re_grpc_server`) is a **sparse crate fork** of
 **upstream `re_grpc_server` 0.34.1** (from `rerun-io/rerun`, exactly as published
@@ -154,8 +154,69 @@ compiled behavior.
   `run`/`clap`/`web_viewer` on `rerun`, those upstream literals would need the
   field. Watch this on any `rerun` feature change.
 
+## Patch 2 (CER-959) — `live_temporal_budget_bytes`: the LIVE queue
+
+CER-858 (above) killed the per-client **replay** buffer. There is a **second,
+independent buffer on the same path** it did not touch: the **live broadcast
+queue** every already-connected viewer reads from.
+
+`EventLoop::handle_msg` hands every message to a byte-quota'd broadcast channel
+(`CHANNEL_SIZE_MESSAGES` = 1024 messages, `CHANNEL_SIZE_BYTES` = 128 MiB — private
+crate constants, not `ServerOptions` knobs, which is why CER-858 could not reach
+them) and **awaits** space when it is full. So a viewer that renders slower than
+the producer publishes accumulates frames there.
+
+Measured (`cerulion-base`, `cer959_live_backlog_test.rs`, a 1280x720 RGB8 frame at
+30 Hz, which is what `cerulion-vizd` logs per decoded H.264 picture since CER-922
+decodes on the desk): against a receiver that keeps up the queue holds **0 bytes**;
+against one that does not it reached **27.8 MB — 10.1 frames — in 2.4 s** and kept
+climbing, headed for the 128 MiB ceiling at ~47 frames ≈ **1.6 s of stale video** a
+viewer must play through before it shows the present. That is the founder's pt58
+report ("h264 topic in the shell is still really laggy") surviving a decode fix
+that made the decode itself sub-millisecond.
+
+Founder ruling (pt58, verbatim): *"we want no history wherever possible (ofc things
+like plots should only start showing history etc when you start vizing them, but
+not before). so there shouldnt be a buffer for clouds or images etc."*
+
+### The knob
+
+`ServerOptions::live_temporal_budget_bytes: Option<u64>`. `None` (default) is
+stock behaviour. `Some(n)`: when the live queue already holds more than `n` bytes,
+a further **temporal** message is DROPPED instead of awaited.
+
+- **Only temporal is eligible.** `SetStoreInfo`, blueprint chunks, blueprint
+  activation commands and `is_static` chunks are the scene skeleton a viewer
+  cannot render without, and always take the reliable awaiting path. The
+  classifier (`is_temporal`) mirrors `MessageBuffer::add_log_msg`'s own
+  classification exactly, and is oracle-tested in both directions
+  (`only_recording_data_on_a_timeline_is_temporal`) — mutation-verified: dropping
+  either the `is_static` guard or the blueprint guard fails it.
+- **Dropping, not a smaller quota.** Shrinking `CHANNEL_SIZE_BYTES` would make the
+  event loop AWAIT sooner — and that same loop serves `Event::NewClient`, so a
+  wedged viewer would stop *new* viewers from connecting at all. Dropping never
+  blocks the loop.
+- **One message always fits.** The gate compares the budget against the CURRENT
+  occupancy, so an empty queue accepts a message of any size.
+- **Never silent.** The running total of dropped bytes is reported as
+  `live_dropped` by `MessageProxyHandle::capture_memory`, beside `broadcast` /
+  `disposable` / `static` / `persistent`, plus a `debug_once!` breadcrumb.
+
+### Residual
+
+In the CER-906 *fallback* regime (no local H.264 decoder, so the VIEWER decodes and
+vizd forwards raw `VideoStream` samples) a dropped sample breaks the P-frame
+reference chain until the next keyframe. The drop only fires once the viewer is
+already megabytes behind — a stream that is already unusable — and CER-922 made
+desk-side decode the default, so the fallback is the rare path. Recorded here
+rather than guarded, because the alternative (never dropping) is the seconds-of-lag
+behaviour this patch exists to remove.
+
 ## Exit condition
 
 Drop this fork entirely (revert to the crates.io `re_grpc_server`, prune the
 `[patch.crates-io]` rev and the `deny.toml [sources]` entry) if upstream
-`re_grpc_server` ever ships a statics-only / drop-temporal history mode.
+`re_grpc_server` ever ships BOTH a statics-only / drop-temporal history mode
+(CER-858) and a bounded, non-blocking live queue (CER-959). Upstream already
+carries a `TODO(emilk)` to move `CHANNEL_SIZE_MESSAGES`/`CHANNEL_SIZE_BYTES` into
+`ServerOptions`, which would be the natural home for the second half.

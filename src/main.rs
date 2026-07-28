@@ -15,7 +15,8 @@ async fn main() -> anyhow::Result<()> {
             playback_behavior: re_grpc_server::PlaybackBehavior::OldestFirst,
             memory_limit: re_grpc_server::MemoryLimit::from_fraction_of_total(0.75),
             cors_allowed_origins: vec![],
-            drop_temporal_history: false, // CERULION PATCH (CER-858)
+            drop_temporal_history: false,     // CERULION PATCH (CER-858)
+            live_temporal_budget_bytes: None, // CERULION PATCH (CER-959)
         },
         shutdown::never(),
     )

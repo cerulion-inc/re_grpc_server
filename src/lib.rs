@@ -84,6 +84,41 @@ pub struct ServerOptions {
     /// buffer that drops it. Default `false` (stock `re_grpc_server` behavior).
     /// See `CERULION-PATCH.md` at this crate's root.
     pub drop_temporal_history: bool,
+
+    /// CERULION PATCH (CER-959): a byte budget for TEMPORAL (disposable) data
+    /// sitting in the LIVE broadcast queue. `Some(n)` ⇒ when the queue already
+    /// holds more than `n` bytes, a further temporal message is DROPPED rather
+    /// than awaited; `None` (the default) is stock behaviour.
+    ///
+    /// This is a different buffer from [`Self::drop_temporal_history`]'s. That
+    /// one is the per-client REPLAY history (what a late joiner is sent on
+    /// connect). This one is the LIVE path every already-connected viewer reads,
+    /// which is byte-quota'd at `CHANNEL_SIZE_BYTES` (128 MiB) and **awaited**
+    /// when full — so a viewer that renders slower than the producer publishes
+    /// accumulates frames there. For a 30 Hz camera decoded to raw RGB8 (a
+    /// 1280x720 frame is 2.6 MiB) that is ~47 frames ≈ 1.6 s of stale video the
+    /// viewer must play through before it shows the present, measured climbing
+    /// at ~4 frames/s against an undrained receiver.
+    ///
+    /// Under a budget, the live queue stays at most `n` + one message deep, so
+    /// what a viewer sees is bounded to the present regardless of how far behind
+    /// it falls. Only TEMPORAL messages are eligible: `persistent`
+    /// (`SetStoreInfo` / blueprint / activation) and `static_` chunks are the
+    /// scene skeleton every viewer needs and always take the reliable awaiting
+    /// path, so a busy live stream can never cost a client its scene.
+    ///
+    /// The budget must exceed the largest single message or that message could
+    /// never cross; the drop is a `>` comparison against the CURRENT occupancy,
+    /// so one message always fits an empty queue whatever its size.
+    ///
+    /// Dropping (rather than shrinking `CHANNEL_SIZE_BYTES`) is deliberate:
+    /// shrinking would make the event loop AWAIT sooner, and that loop also
+    /// serves `Event::NewClient`, so a wedged viewer would stop new viewers from
+    /// connecting at all. Dropping never blocks the loop.
+    ///
+    /// Drops are counted, never silent: the running total is reported as
+    /// `live_dropped` by [`MessageProxyHandle::capture_memory`].
+    pub live_temporal_budget_bytes: Option<u64>,
 }
 
 impl Default for ServerOptions {
@@ -92,7 +127,8 @@ impl Default for ServerOptions {
             playback_behavior: PlaybackBehavior::OldestFirst,
             memory_limit: MemoryLimit::from_bytes(1024 * 1024 * 1024), // Be very conservative by default
             cors_allowed_origins: Vec::new(),
-            drop_temporal_history: false, // CERULION PATCH (CER-858)
+            drop_temporal_history: false,     // CERULION PATCH (CER-858)
+            live_temporal_budget_bytes: None, // CERULION PATCH (CER-959)
         }
     }
 }
@@ -1122,6 +1158,45 @@ struct EventLoop {
 
     /// Latest memory snapshot, refreshed on `Event::CaptureMemory`.
     memory_snapshot: MemorySnapshot,
+
+    /// CERULION PATCH (CER-959): running total of TEMPORAL bytes dropped because
+    /// the live queue was over [`ServerOptions::live_temporal_budget_bytes`].
+    /// Reported as `live_dropped` by `capture_memory` so the drop is observable,
+    /// never silent — and so a test can tell "the queue is small because frames
+    /// were dropped" from "the queue is small because nothing was sent".
+    live_dropped_bytes: u64,
+}
+
+/// CERULION PATCH (CER-959): is this message TEMPORAL (recording data on a
+/// timeline), as opposed to the scene skeleton every viewer needs?
+///
+/// Mirrors [`MessageBuffer::add_log_msg`]'s classification exactly: a blueprint
+/// chunk and an `is_static` chunk are skeleton; every other `ArrowMsg` is
+/// temporal. `SetStoreInfo` and `BlueprintActivationCommand` are skeleton.
+/// Tables and UI commands are treated as temporal, matching `add_msg`, which
+/// files them under `disposable`.
+///
+/// Cheap: reads proto fields only, no payload decode.
+fn is_temporal(msg: &LogOrTableMsgProto) -> bool {
+    let LogOrTableMsgProto::LogMsg(log_msg) = msg else {
+        // Tables / UI commands are `disposable` in `add_msg`.
+        return true;
+    };
+    use re_protos::log_msg::v1alpha1::log_msg::Msg;
+    match log_msg.msg.as_ref() {
+        // Store info + activation commands are skeleton. `None` (a payload-less,
+        // malformed message that `add_log_msg` logs and drops) rides the same arm
+        // deliberately: classifying it skeleton keeps THIS gate from being the
+        // thing that silently eats it, so the existing diagnostic still fires.
+        None | Some(Msg::SetStoreInfo(..) | Msg::BlueprintActivationCommand(..)) => false,
+        Some(Msg::ArrowMsg(arrow)) => {
+            let is_blueprint = arrow
+                .store_id
+                .as_ref()
+                .is_some_and(|id| id.kind() == StoreKindProto::Blueprint);
+            !is_blueprint && arrow.is_static != Some(true)
+        }
+    }
 }
 
 impl EventLoop {
@@ -1142,6 +1217,7 @@ impl EventLoop {
             event_rx,
             history,
             memory_snapshot,
+            live_dropped_bytes: 0, // CERULION PATCH (CER-959)
         }
     }
 
@@ -1178,11 +1254,29 @@ impl EventLoop {
                 .with_child("disposable", self.history.disposable.size_bytes)
                 .with_child("static", self.history.static_.size_bytes)
                 .with_child("persistent", self.history.persistent.size_bytes)
-                .with_child("broadcast", self.broadcast_log_tx.bytes_in_flight()),
+                .with_child("broadcast", self.broadcast_log_tx.bytes_in_flight())
+                // CERULION PATCH (CER-959): observable drop accounting.
+                .with_child("live_dropped", self.live_dropped_bytes),
         )
     }
 
     async fn handle_msg(&mut self, msg: LogOrTableMsgProto) {
+        // CERULION PATCH (CER-959): a TEMPORAL message that would push the LIVE
+        // queue past its budget is DROPPED, not awaited — a viewer that is
+        // already behind is served the present rather than a backlog it has to
+        // play through. Persistent/static (the scene skeleton) are never
+        // eligible; see `ServerOptions::live_temporal_budget_bytes`.
+        if self.should_drop_live(&msg) {
+            self.live_dropped_bytes = self
+                .live_dropped_bytes
+                .saturating_add(msg.total_size_bytes());
+            re_log::debug_once!(
+                "Dropping live temporal data: a viewer is not keeping up and the live queue is over \
+                 its budget. The stream stays current instead of accumulating a backlog."
+            );
+            return;
+        }
+
         // This will block if the broadcast channel is full, applying back-pressure
         self.broadcast_log_tx.send_async(msg.clone()).await.ok();
 
@@ -1194,6 +1288,25 @@ impl EventLoop {
         self.gc_if_using_too_much_ram();
 
         self.history.add_msg(msg);
+    }
+
+    /// CERULION PATCH (CER-959): is `msg` a TEMPORAL message arriving at a live
+    /// queue that is already over budget?
+    ///
+    /// `false` whenever no budget is configured (stock behaviour), whenever the
+    /// message is part of the scene skeleton (`SetStoreInfo`, blueprint data,
+    /// activation commands, `is_static` chunks — a viewer cannot render without
+    /// them, so they always take the reliable awaiting path), and whenever the
+    /// queue is within budget. The comparison is against the CURRENT occupancy,
+    /// so a message always fits an empty queue however large it is.
+    fn should_drop_live(&self, msg: &LogOrTableMsgProto) -> bool {
+        let Some(budget) = self.options.live_temporal_budget_bytes else {
+            return false;
+        };
+        if !is_temporal(msg) {
+            return false;
+        }
+        budget < self.broadcast_log_tx.bytes_in_flight()
     }
 
     fn is_history_enabled(&self) -> bool {
@@ -1750,7 +1863,8 @@ mod tests {
             playback_behavior: PlaybackBehavior::OldestFirst,
             memory_limit: MemoryLimit::UNLIMITED,
             cors_allowed_origins: vec![],
-            drop_temporal_history: false, // CERULION PATCH (CER-858)
+            drop_temporal_history: false,     // CERULION PATCH (CER-858)
+            live_temporal_budget_bytes: None, // CERULION PATCH (CER-959)
         })
         .await
     }
@@ -1760,7 +1874,8 @@ mod tests {
             playback_behavior: PlaybackBehavior::OldestFirst,
             memory_limit,
             cors_allowed_origins: vec![],
-            drop_temporal_history: false, // CERULION PATCH (CER-858)
+            drop_temporal_history: false,     // CERULION PATCH (CER-858)
+            live_temporal_budget_bytes: None, // CERULION PATCH (CER-959)
         })
         .await
     }
@@ -1774,6 +1889,7 @@ mod tests {
             memory_limit: MemoryLimit::UNLIMITED,
             cors_allowed_origins: vec![],
             drop_temporal_history: true,
+            live_temporal_budget_bytes: None, // CERULION PATCH (CER-959)
         })
         .await
     }
@@ -2102,6 +2218,62 @@ mod tests {
         completion.finish();
     }
 
+    // CERULION PATCH (CER-959): `is_temporal` decides which messages the live
+    // budget may drop. Getting it wrong in the SKELETON direction is the
+    // dangerous one — a dropped `SetStoreInfo`, blueprint or static leaves a
+    // viewer unable to render at all — so this pins BOTH directions against a
+    // hand-written oracle over the exact production encode path (`proto_of`).
+    #[test]
+    fn only_recording_data_on_a_timeline_is_temporal() {
+        let rec = StoreId::random(StoreKind::Recording, "test_app");
+        let bp = StoreId::random(StoreKind::Blueprint, "test_app");
+
+        // SKELETON — never eligible for the live-budget drop.
+        let skeleton: Vec<(&str, LogMsg)> = vec![
+            ("recording SetStoreInfo", set_store_info_msg(&rec)),
+            ("blueprint SetStoreInfo", set_store_info_msg(&bp)),
+            ("static chunk", static_msg_for_entity(&rec, "entity_a")),
+            (
+                "blueprint chunk",
+                generate_log_messages(&bp, 1, Temporalness::Temporal)
+                    .pop()
+                    .unwrap(),
+            ),
+            (
+                "blueprint activation",
+                LogMsg::BlueprintActivationCommand(re_log_types::BlueprintActivationCommand {
+                    blueprint_id: bp.clone(),
+                    make_active: true,
+                    make_default: true,
+                }),
+            ),
+        ];
+        for (what, msg) in &skeleton {
+            assert!(
+                !is_temporal(&proto_of(msg)),
+                "{what} is scene skeleton — it must NEVER be dropped by the live budget"
+            );
+        }
+
+        // TEMPORAL — recording data on a timeline, the only eligible class.
+        let temporal = generate_log_messages(&rec, 2, Temporalness::Temporal);
+        for msg in &temporal {
+            assert!(
+                is_temporal(&proto_of(msg)),
+                "a recording chunk on a timeline is temporal and IS eligible"
+            );
+        }
+
+        // Anti-tautology: a blueprint chunk and a recording chunk are built by
+        // the SAME helper and differ ONLY in store kind, so the skeleton arm
+        // above cannot be passing because the helper produces something inert.
+        assert_ne!(
+            is_temporal(&proto_of(&skeleton[3].1)),
+            is_temporal(&proto_of(&temporal[0])),
+            "the blueprint/recording distinction is what the classifier reads"
+        );
+    }
+
     // CERULION PATCH (CER-858, F1): under `drop_temporal`, three sequential
     // blueprint sends (each a FRESH blueprint store — the Studio `set_blueprint`
     // churn shape) must leave `persistent` holding ONLY the last blueprint store's
@@ -2344,7 +2516,8 @@ mod tests {
             playback_behavior: PlaybackBehavior::NewestFirst, // this is what we want to test
             memory_limit: MemoryLimit::UNLIMITED,
             cors_allowed_origins: vec![],
-            drop_temporal_history: false, // CERULION PATCH (CER-858)
+            drop_temporal_history: false,     // CERULION PATCH (CER-858)
+            live_temporal_budget_bytes: None, // CERULION PATCH (CER-959)
         })
         .await;
         let mut client = make_client(addr).await;
