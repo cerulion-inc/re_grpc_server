@@ -187,15 +187,26 @@ a further **temporal** message is DROPPED instead of awaited.
 
 - **Only temporal is eligible.** `SetStoreInfo`, blueprint chunks, blueprint
   activation commands and `is_static` chunks are the scene skeleton a viewer
-  cannot render without, and always take the reliable awaiting path. The
-  classifier (`is_temporal`) mirrors `MessageBuffer::add_log_msg`'s own
-  classification exactly, and is oracle-tested in both directions
+  cannot render without, and always take the reliable awaiting path. So are
+  `TableMsg` (a one-shot dataframe — dropping it loses the whole table while the
+  writer still gets an `Ok`) and `DataSourceUiCommand` (control, carrying an
+  `on_done` responder whose loss surfaces to the caller as a *viewer* fault).
+  Those two are `disposable` in `MessageBuffer`, but that word there means "not
+  worth REPLAYING to a late joiner", which does not imply "safe to never deliver".
+  The classifier (`is_temporal`) mirrors `add_log_msg` for `LogMsg` and is
+  oracle-tested in both directions
   (`only_recording_data_on_a_timeline_is_temporal`) — mutation-verified: dropping
   either the `is_static` guard or the blueprint guard fails it.
-- **Dropping, not a smaller quota.** Shrinking `CHANNEL_SIZE_BYTES` would make the
-  event loop AWAIT sooner — and that same loop serves `Event::NewClient`, so a
-  wedged viewer would stop *new* viewers from connecting at all. Dropping never
-  blocks the loop.
+- **Both quotas are guarded.** The channel is bounded by `CHANNEL_SIZE_BYTES`
+  *and* `CHANNEL_SIZE_MESSAGES` (1024), and `send_async` awaits when EITHER is
+  reached. A byte-only gate would therefore still wedge: a stream of small
+  messages (plots, `/tf`, telemetry at a few KB each) reaches 1024 messages at
+  only a few MiB, so an 8 MiB budget never fires, the send awaits, and the event
+  loop — which also serves `Event::NewClient` — stalls. The gate keeps
+  `LIVE_MESSAGE_RESERVE` (64) slots free on the message axis too, which is also
+  what guarantees skeleton messages somewhere to go while temporal is being shed.
+- **Dropping, not a smaller quota.** Shrinking either quota would make the event
+  loop AWAIT sooner, with the same `Event::NewClient` consequence.
 - **One message always fits.** The gate compares the budget against the CURRENT
   occupancy, so an empty queue accepts a message of any size.
 - **Never silent, never a flood.** A dropped frame must not leave an operator
@@ -210,7 +221,15 @@ a further **temporal** message is DROPPED instead of awaited.
   (`a_drop_regime_is_loud_once_then_accumulates_until_it_closes`). The
   unconditional running total is additionally reported as `live_dropped` by
   `MessageProxyHandle::capture_memory`, beside `broadcast` / `disposable` /
-  `static` / `persistent`, so it survives log filtering.
+  `static` / `persistent`.
+- **Honest limit on that counter.** A host that reaches this server through
+  `re_sdk`'s `GrpcServerSink` (which is how `cerulion-vizd` hosts it) gets no
+  `MessageProxyHandle` back — `serve_from_channel` constructs the `MessageProxy`
+  internally and never returns a handle — so `capture_memory` is not callable
+  from such a host at all, and for them the LOG is the entire window. Exposing it
+  properly needs a `spawn_from_channel` returning the handle (mirroring
+  `spawn_from_rx_set`) plus plumbing through `re_sdk`; recorded as a follow-up
+  rather than claimed.
 
 ### Interaction with the replay history
 

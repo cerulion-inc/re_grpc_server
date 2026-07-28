@@ -108,16 +108,27 @@ pub struct ServerOptions {
     /// path, so a busy live stream can never cost a client its scene.
     ///
     /// The budget must exceed the largest single message or that message could
-    /// never cross; the drop is a `>` comparison against the CURRENT occupancy,
-    /// so one message always fits an empty queue whatever its size.
+    /// never cross; the drop compares against the CURRENT occupancy, so one
+    /// message always fits an empty queue whatever its size.
     ///
-    /// Dropping (rather than shrinking `CHANNEL_SIZE_BYTES`) is deliberate:
-    /// shrinking would make the event loop AWAIT sooner, and that loop also
-    /// serves `Event::NewClient`, so a wedged viewer would stop new viewers from
-    /// connecting at all. Dropping never blocks the loop.
+    /// **The gate watches BOTH quotas, not just this one.** The channel is
+    /// bounded by `CHANNEL_SIZE_BYTES` *and* `CHANNEL_SIZE_MESSAGES` (1024), and
+    /// `send_async` awaits when EITHER is reached — so a byte-only gate would let
+    /// a stream of small messages (plots, `/tf`, telemetry) reach the message
+    /// quota at a few MiB, await, and stall the event loop while this budget
+    /// never fired. See [`LIVE_MESSAGE_RESERVE`].
     ///
-    /// Drops are counted, never silent: the running total is reported as
-    /// `live_dropped` by [`MessageProxyHandle::capture_memory`].
+    /// Dropping (rather than shrinking either quota) is deliberate: shrinking
+    /// would make the event loop AWAIT sooner, and that loop also serves
+    /// `Event::NewClient`, so a wedged viewer would stop new viewers from
+    /// connecting at all.
+    ///
+    /// Drops are reported, never silent: the first drop of a regime is a `warn!`,
+    /// repeats are `debug!` carrying running totals, and recovery is one `info!`.
+    /// The unconditional running total is additionally exposed as `live_dropped`
+    /// by [`MessageProxyHandle::capture_memory`] — note that a host reaching this
+    /// server through `re_sdk`'s `GrpcServerSink` has no handle to call it with,
+    /// so for those hosts the LOG is the whole window.
     pub live_temporal_budget_bytes: Option<u64>,
 }
 
@@ -1177,32 +1188,134 @@ struct EventLoop {
     dropping_since: Option<u64>,
 }
 
-/// CERULION PATCH (CER-959): advance the drop-regime accumulator by `bytes`.
+/// CERULION PATCH (CER-959): message slots reserved for the SCENE SKELETON.
 ///
-/// Returns the regime's running total and whether this drop OPENED the regime
-/// (i.e. is the one that gets the loud line). Pure, so the loud-once /
-/// suppressed-repeat policy is oracle-testable without a running server.
-fn advance_drop_regime(open_regime: Option<u64>, bytes: u64) -> (u64, bool) {
-    match open_regime {
-        Some(total) => (total.saturating_add(bytes), false),
-        None => (bytes, true),
+/// The live channel has TWO quotas — [`CHANNEL_SIZE_BYTES`] and
+/// [`CHANNEL_SIZE_MESSAGES`] — and `send_async` awaits when EITHER is reached.
+/// A byte-only gate is therefore not enough to keep the event loop unblocked:
+/// a stream of small messages (plots, `/tf`, telemetry — kilobytes each) reaches
+/// 1024 messages at only a few MiB, so a byte budget of 8 MiB never fires, the
+/// send awaits, and the loop — which also serves `Event::NewClient` — stalls,
+/// which is exactly the wedge dropping exists to avoid.
+///
+/// So the gate watches the MESSAGE axis too, keeping this many slots free.
+/// Skeleton messages are never dropped, so the reserve is what guarantees they
+/// still have somewhere to go while temporal traffic is being shed.
+const LIVE_MESSAGE_RESERVE: usize = 64;
+
+/// CERULION PATCH (CER-959): the live queue's occupancy on both quota axes.
+#[derive(Clone, Copy, Debug)]
+struct LiveOccupancy {
+    bytes: u64,
+    messages: usize,
+    max_messages: usize,
+}
+
+/// CERULION PATCH (CER-959): what the live-queue gate decided for one message.
+#[derive(Debug, PartialEq, Eq)]
+enum LiveDecision {
+    /// Send it. `closes_regime` carries the finished regime's dropped-byte total
+    /// when this admission ENDS a drop regime (⇒ report recovery + re-arm).
+    Admit { closes_regime: Option<u64> },
+    /// Drop it. `regime_total` is the running total for the open regime; `loud`
+    /// marks the regime's head (the one line an operator must see).
+    Drop { regime_total: u64, loud: bool },
+}
+
+/// CERULION PATCH (CER-959): the WHOLE live-queue policy as a pure function —
+/// admission, the loud-once/suppressed-repeat cycle, and the recovery re-arm.
+///
+/// Pure so that every branch is oracle-testable without a running server. That
+/// matters most for the re-arm: a regime that never closes turns every later
+/// incident into a suppressed `debug!`, i.e. permanent silence after the first
+/// one, and a behaviour-free implementation would let that mutation through.
+///
+/// # Hysteresis
+///
+/// The regime closes only once the queue is COMFORTABLY back under budget (half,
+/// on both axes), not the instant one message fits. Without that, a viewer
+/// rendering marginally slower than the producer — the expected steady state at
+/// the boundary, not a corner — oscillates across the threshold and pays a
+/// `warn!` + an `info!` per oscillation, which at frame rate is the log-flood
+/// class the regime cycle exists to prevent. In the band between the two marks a
+/// message is admitted while the regime stays open: no drop, no log.
+fn decide_live(
+    budget: Option<u64>,
+    occ: LiveOccupancy,
+    temporal: bool,
+    msg_bytes: u64,
+    open_regime: Option<u64>,
+) -> LiveDecision {
+    // No budget, or a message the budget may never touch (the scene skeleton,
+    // tables, UI commands) ⇒ always admit, and never let it close a regime: only
+    // a TEMPORAL message getting through proves the viewer caught up.
+    let (Some(budget), true) = (budget, temporal) else {
+        return LiveDecision::Admit {
+            closes_regime: None,
+        };
+    };
+
+    let over_bytes = budget < occ.bytes;
+    let over_messages = occ.max_messages <= occ.messages.saturating_add(LIVE_MESSAGE_RESERVE);
+    if over_bytes || over_messages {
+        return match open_regime {
+            Some(total) => LiveDecision::Drop {
+                regime_total: total.saturating_add(msg_bytes),
+                loud: false,
+            },
+            None => LiveDecision::Drop {
+                regime_total: msg_bytes,
+                loud: true,
+            },
+        };
+    }
+
+    // Admitted. Close an open regime only past the LOW-WATER mark on both axes.
+    let recovered_bytes = occ.bytes < budget / 2;
+    let recovered_messages = occ
+        .messages
+        .saturating_mul(2)
+        .saturating_add(LIVE_MESSAGE_RESERVE)
+        < occ.max_messages;
+    LiveDecision::Admit {
+        closes_regime: match open_regime {
+            Some(total) if recovered_bytes && recovered_messages => Some(total),
+            _ => None,
+        },
     }
 }
 
 /// CERULION PATCH (CER-959): is this message TEMPORAL (recording data on a
-/// timeline), as opposed to the scene skeleton every viewer needs?
+/// timeline), i.e. eligible for the live-queue drop?
 ///
-/// Mirrors [`MessageBuffer::add_log_msg`]'s classification exactly: a blueprint
-/// chunk and an `is_static` chunk are skeleton; every other `ArrowMsg` is
-/// temporal. `SetStoreInfo` and `BlueprintActivationCommand` are skeleton.
-/// Tables and UI commands are treated as temporal, matching `add_msg`, which
-/// files them under `disposable`.
+/// For `LogMsg` this mirrors [`MessageBuffer::add_log_msg`]'s classification
+/// exactly: a blueprint chunk and an `is_static` chunk are skeleton; every other
+/// `ArrowMsg` is temporal; `SetStoreInfo` and `BlueprintActivationCommand` are
+/// skeleton.
+///
+/// **Tables and UI commands are NOT temporal**, deliberately parting from
+/// `add_msg`, which files them under `disposable`. Those two words mean different
+/// things: `disposable` there means "not worth REPLAYING to a late joiner", which
+/// does not imply "safe to never deliver at all".
+///
+/// - A [`TableMsg`] is a ONE-SHOT dataframe from `send_table`. Dropping it loses
+///   the whole table, and the writer still gets `Ok(WriteTableResponse)` — a
+///   silent success for data that never arrived.
+/// - A [`DataSourceUiCommand`] is CONTROL (`SetTimeCursor`, `SaveScreenshot`,
+///   `GetViewerState`, …), each carrying an `on_done` responder. Dropping it
+///   drops the responder, and the caller gets "viewer dropped the … request
+///   before responding (is a viewer running?)" — a diagnostic blaming the viewer
+///   for a proxy-side budget decision.
+///
+/// Neither is high-rate sensor data, so exempting them costs nothing the budget
+/// exists to bound.
 ///
 /// Cheap: reads proto fields only, no payload decode.
 fn is_temporal(msg: &LogOrTableMsgProto) -> bool {
     let LogOrTableMsgProto::LogMsg(log_msg) = msg else {
-        // Tables / UI commands are `disposable` in `add_msg`.
-        return true;
+        // Tables (one-shot data) + UI commands (control, with a responder) are
+        // never dropped — see the fn docs.
+        return false;
     };
     use re_protos::log_msg::v1alpha1::log_msg::Msg;
     match log_msg.msg.as_ref() {
@@ -1289,13 +1402,23 @@ impl EventLoop {
         // already behind is served the present rather than a backlog it has to
         // play through. Persistent/static (the scene skeleton) are never
         // eligible; see `ServerOptions::live_temporal_budget_bytes`.
-        if self.should_drop_live(&msg) {
-            self.report_live_drop(msg.total_size_bytes());
-            return;
-        }
-        // RECOVERY: a temporal message got through, so the viewer caught up.
-        if is_temporal(&msg) && self.dropping_since.is_some() {
-            self.report_live_recovery();
+        let bytes = msg.total_size_bytes();
+        match decide_live(
+            self.options.live_temporal_budget_bytes,
+            self.live_occupancy(),
+            is_temporal(&msg),
+            bytes,
+            self.dropping_since,
+        ) {
+            LiveDecision::Drop { regime_total, loud } => {
+                self.report_live_drop(bytes, regime_total, loud);
+                return;
+            }
+            LiveDecision::Admit { closes_regime } => {
+                if let Some(regime_total) = closes_regime {
+                    self.report_live_recovery(regime_total);
+                }
+            }
         }
 
         // This will block if the broadcast channel is full, applying back-pressure
@@ -1319,21 +1442,29 @@ impl EventLoop {
     /// rate for as long as the viewer is behind). So the first drop of a regime
     /// is one `warn!` and every repeat is a `debug!` carrying the running totals;
     /// [`Self::report_live_recovery`] closes the regime and re-arms.
-    fn report_live_drop(&mut self, bytes: u64) {
+    fn report_live_drop(&mut self, bytes: u64, regime_total: u64, loud: bool) {
         self.live_dropped_bytes = self.live_dropped_bytes.saturating_add(bytes);
-        let (regime_total, first_of_regime) = advance_drop_regime(self.dropping_since, bytes);
         self.dropping_since = Some(regime_total);
-        if first_of_regime {
+        // Structured fields, not interpolated numbers, so an operator can filter
+        // and grep these the way they do every other Cerulion drop counter.
+        if loud {
             re_log::warn!(
                 "Live viz is dropping frames: a viewer is not consuming as fast as this stream \
-                 produces, and the live queue is over its budget ({} bytes). Frames are dropped so \
-                 the viewer keeps showing the PRESENT instead of playing through a growing \
-                 backlog. The scene (blueprint, statics) is never dropped.",
-                self.options.live_temporal_budget_bytes.unwrap_or(0)
+                 produces. Frames are dropped so the viewer keeps showing the PRESENT instead of \
+                 playing through a growing backlog; the scene (blueprint, statics) is never \
+                 dropped. live_budget_bytes={} queue_bytes={} queue_messages={} \
+                 dropped_bytes={bytes} total_dropped_bytes={}",
+                self.options
+                    .live_temporal_budget_bytes
+                    .map_or_else(|| "none".to_owned(), |b| b.to_string()),
+                self.broadcast_log_tx.bytes_in_flight(),
+                self.broadcast_log_tx.messages_in_flight(),
+                self.live_dropped_bytes,
             );
         } else {
             re_log::debug!(
-                "Live viz still dropping: {regime_total} bytes dropped this regime, {} total.",
+                "Live viz still dropping. regime_dropped_bytes={regime_total} \
+                 dropped_bytes={bytes} total_dropped_bytes={}",
                 self.live_dropped_bytes
             );
         }
@@ -1341,33 +1472,26 @@ impl EventLoop {
 
     /// CERULION PATCH (CER-959): close an open drop regime — report what it cost,
     /// once, and re-arm so the next one is loud again.
-    fn report_live_recovery(&mut self) {
-        if let Some(dropped) = self.dropping_since.take() {
-            re_log::info!(
-                "Live viz recovered: the viewer is keeping up again ({dropped} bytes were dropped \
-                 while it was behind, {} total).",
-                self.live_dropped_bytes
-            );
-        }
+    ///
+    /// The decision to close is [`decide_live`]'s (past a low-water mark on both
+    /// axes, not the instant one message fits); this only reports it. The wording
+    /// claims only what is established: the queue drained back under the mark.
+    fn report_live_recovery(&mut self, regime_total: u64) {
+        self.dropping_since = None;
+        re_log::info!(
+            "Live viz is no longer dropping: the live queue drained back under its budget. \
+             regime_dropped_bytes={regime_total} total_dropped_bytes={}",
+            self.live_dropped_bytes
+        );
     }
 
-    /// CERULION PATCH (CER-959): is `msg` a TEMPORAL message arriving at a live
-    /// queue that is already over budget?
-    ///
-    /// `false` whenever no budget is configured (stock behaviour), whenever the
-    /// message is part of the scene skeleton (`SetStoreInfo`, blueprint data,
-    /// activation commands, `is_static` chunks — a viewer cannot render without
-    /// them, so they always take the reliable awaiting path), and whenever the
-    /// queue is within budget. The comparison is against the CURRENT occupancy,
-    /// so a message always fits an empty queue however large it is.
-    fn should_drop_live(&self, msg: &LogOrTableMsgProto) -> bool {
-        let Some(budget) = self.options.live_temporal_budget_bytes else {
-            return false;
-        };
-        if !is_temporal(msg) {
-            return false;
+    /// CERULION PATCH (CER-959): the live queue's occupancy on both quota axes.
+    fn live_occupancy(&self) -> LiveOccupancy {
+        LiveOccupancy {
+            bytes: self.broadcast_log_tx.bytes_in_flight(),
+            messages: self.broadcast_log_tx.messages_in_flight(),
+            max_messages: self.broadcast_log_tx.max_messages(),
         }
-        budget < self.broadcast_log_tx.bytes_in_flight()
     }
 
     fn is_history_enabled(&self) -> bool {
@@ -2285,40 +2409,158 @@ mod tests {
     // FLOOD (this fires at frame rate for as long as a viewer is behind), so the
     // FIRST drop of each regime is loud and the rest are suppressed repeats
     // carrying the running total.
+    /// Occupancy helper: `bytes` used, `messages` used, out of 1024 slots.
+    fn occ(bytes: u64, messages: usize) -> LiveOccupancy {
+        LiveOccupancy {
+            bytes,
+            messages,
+            max_messages: CHANNEL_SIZE_MESSAGES,
+        }
+    }
+
+    const BUDGET: u64 = 8 * 1024 * 1024;
+
     #[test]
     fn a_drop_regime_is_loud_once_then_accumulates_until_it_closes() {
-        // Regime 1: three drops. Only the first is loud; the total accumulates.
-        let (t1, loud1) = advance_drop_regime(None, 100);
+        // Regime 1: two drops. Only the first is loud; the total accumulates.
         assert_eq!(
-            (t1, loud1),
-            (100, true),
+            decide_live(Some(BUDGET), occ(BUDGET + 1, 4), true, 100, None),
+            LiveDecision::Drop {
+                regime_total: 100,
+                loud: true
+            },
             "the first drop opens the regime and is LOUD"
         );
-        let (t2, loud2) = advance_drop_regime(Some(t1), 250);
         assert_eq!(
-            (t2, loud2),
-            (350, false),
+            decide_live(Some(BUDGET), occ(BUDGET + 1, 4), true, 250, Some(100)),
+            LiveDecision::Drop {
+                regime_total: 350,
+                loud: false
+            },
             "a repeat is suppressed and accumulates"
         );
-        let (t3, loud3) = advance_drop_regime(Some(t2), 50);
-        assert_eq!((t3, loud3), (400, false), "and keeps accumulating");
 
-        // Recovery CLOSES the regime (the caller `take()`s it), so the next drop
-        // is loud again and counts from zero — a viewer that flaps does not go
-        // silent after its first bad patch.
-        let (t4, loud4) = advance_drop_regime(None, 7);
+        // HYSTERESIS: back under budget but ABOVE the low-water mark => admitted,
+        // regime stays OPEN, nothing logged. Without this a viewer sitting at the
+        // boundary pays a warn! + an info! per oscillation, at frame rate.
         assert_eq!(
-            (t4, loud4),
-            (7, true),
-            "after recovery re-arms the regime, the next drop is LOUD again"
+            decide_live(Some(BUDGET), occ(BUDGET - 1, 4), true, 100, Some(350)),
+            LiveDecision::Admit {
+                closes_regime: None
+            },
+            "inside the hysteresis band: admit, but do NOT declare recovery"
         );
 
-        // No overflow panic on a pathological total.
-        let (t5, loud5) = advance_drop_regime(Some(u64::MAX), 1);
+        // Comfortably drained => the regime CLOSES, reporting what it cost.
         assert_eq!(
-            (t5, loud5),
-            (u64::MAX, false),
+            decide_live(Some(BUDGET), occ(BUDGET / 4, 4), true, 100, Some(350)),
+            LiveDecision::Admit {
+                closes_regime: Some(350)
+            },
+            "past the low-water mark the regime closes and reports its total"
+        );
+
+        // RE-ARM: the next drop after a close is LOUD again and counts from zero.
+        // A viewer that flaps must not go permanently silent after its first bad
+        // patch — a regime that never closes turns every later incident into a
+        // suppressed debug!.
+        assert_eq!(
+            decide_live(Some(BUDGET), occ(BUDGET + 1, 4), true, 7, None),
+            LiveDecision::Drop {
+                regime_total: 7,
+                loud: true
+            },
+            "after recovery, the next drop is LOUD again"
+        );
+
+        // Saturates rather than wrapping.
+        assert_eq!(
+            decide_live(Some(BUDGET), occ(BUDGET + 1, 4), true, 1, Some(u64::MAX)),
+            LiveDecision::Drop {
+                regime_total: u64::MAX,
+                loud: false
+            },
             "saturates rather than wrapping"
+        );
+    }
+
+    /// The MESSAGE axis. `send_async` awaits when EITHER quota is reached, and
+    /// the event loop that would block also serves `Event::NewClient` — so a
+    /// byte-only gate lets a stream of small messages (plots, `/tf`, telemetry)
+    /// wedge the loop at a few MiB, far under any sane byte budget.
+    #[test]
+    fn the_message_quota_is_guarded_not_just_the_byte_budget() {
+        let at_reserve = CHANNEL_SIZE_MESSAGES - LIVE_MESSAGE_RESERVE;
+        // Tiny messages, trivial byte occupancy — the byte gate would never fire.
+        assert_eq!(
+            decide_live(Some(BUDGET), occ(4096, at_reserve), true, 2048, None),
+            LiveDecision::Drop {
+                regime_total: 2048,
+                loud: true
+            },
+            "at the message reserve the gate must DROP even though bytes are trivial — otherwise \
+             send_async awaits and the event loop (which serves Event::NewClient) wedges"
+        );
+        // One slot below the reserve: still admitted.
+        assert_eq!(
+            decide_live(Some(BUDGET), occ(4096, at_reserve - 1), true, 2048, None),
+            LiveDecision::Admit {
+                closes_regime: None
+            },
+            "one slot below the reserve is still admitted — a threshold, not a taper"
+        );
+        // Recovery needs BOTH axes: bytes fine, messages still high => stays open.
+        assert_eq!(
+            decide_live(Some(BUDGET), occ(0, at_reserve - 1), true, 8, Some(999)),
+            LiveDecision::Admit {
+                closes_regime: None
+            },
+            "a queue still deep in MESSAGES has not recovered, however few bytes it holds"
+        );
+    }
+
+    /// The classes the budget may never touch, and the no-budget default.
+    #[test]
+    fn the_budget_never_touches_skeleton_control_or_an_unbudgeted_server() {
+        // A hopelessly over-budget queue on both axes.
+        let jammed = occ(BUDGET * 4, CHANNEL_SIZE_MESSAGES);
+
+        assert_eq!(
+            decide_live(Some(BUDGET), jammed, false, 1024, None),
+            LiveDecision::Admit {
+                closes_regime: None
+            },
+            "the scene skeleton (and tables / UI commands) is never dropped"
+        );
+        // ...and a non-temporal admission must NOT close a regime: only a temporal
+        // message getting through proves the viewer caught up.
+        assert_eq!(
+            decide_live(Some(BUDGET), occ(0, 0), false, 1024, Some(500)),
+            LiveDecision::Admit {
+                closes_regime: None
+            },
+            "a skeleton message crossing an empty queue is not evidence the viewer recovered"
+        );
+        assert_eq!(
+            decide_live(None, jammed, true, 1024, None),
+            LiveDecision::Admit {
+                closes_regime: None
+            },
+            "with no budget the gate is inert (stock re_grpc_server)"
+        );
+    }
+
+    /// One message always crosses an empty queue, however large it is — otherwise
+    /// a payload bigger than the budget could never be delivered at all.
+    #[test]
+    fn a_single_oversized_message_still_crosses_an_empty_queue() {
+        assert_eq!(
+            decide_live(Some(BUDGET), occ(0, 0), true, BUDGET * 10, None),
+            LiveDecision::Admit {
+                closes_regime: None
+            },
+            "the gate compares the budget against the CURRENT occupancy, so an empty queue admits \
+             a message of any size"
         );
     }
 
