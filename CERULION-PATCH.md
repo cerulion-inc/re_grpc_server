@@ -90,7 +90,7 @@ bound**, so both are bounded at buffer time — **ONLY under the flag**; with
 | # | Unbounded path | Fix |
 |---|---|---|
 | F1 | `persistent` grows on every Studio `set_blueprint`: each layout change mints a **FRESH blueprint store**, and every new client would replay ALL superseded blueprints. | When a `BlueprintActivationCommand` for blueprint `B` is buffered, evict from `persistent` every message belonging to a Blueprint-KIND store ≠ `B` (its `SetStoreInfo`, chunks, and stale activation commands), preserving relative order + exact `size_bytes`. A recording-data `SetStoreInfo` is **not** blueprint-kind, so it always survives. Keyed on the blueprint store's `recording_id` (its unique uuid). Gated on the flag — stock upstream keeps every blueprint (the flag's owner activates each new blueprint `make_active`, so "activated = supersedes prior" is exact for Studio). |
-| F2 | `static_` grows on every reconnect: a reconnecting client re-logs the same statics, appending duplicates. | A static `ArrowMsg` for entity `E` **REPLACES** the prior retained static for the same `(store_id, E)` (latest-wins, matching rerun's own static semantics) instead of appending. The entity path is decoded from the arrow payload (`ArrowMsg::to_application` → the batch schema's `rerun:entity_path` metadata) **only on the infrequent static path**; a decode failure falls back to a plain append (never a wrong-key drop). |
+| F2 | `static_` grows on every reconnect: a reconnecting client re-logs the same statics, appending duplicates. | A static `ArrowMsg` for entity `E` **REPLACES** the prior retained static for the same `(store_id, E)` (latest-wins, matching rerun's own static semantics) instead of appending. The entity path is decoded from the arrow payload (`ArrowMsg::to_application` → the batch schema's `rerun:entity_path` metadata) **once, from the ARRIVING message only**, and cached with the buffered entry (see the F2 follow-up below); a decode failure falls back to a plain append (never a wrong-key drop). |
 
 > **F2 caveat.** Replacement is **entity-level**: logging DIFFERENT component sets
 > statically to the SAME entity across sends would drop the earlier components.
@@ -99,12 +99,75 @@ bound**, so both are bounded at buffer time — **ONLY under the flag**; with
 > with no loss.
 
 Files: all in `src/lib.rs` — `MessageBuffer::{evict_superseded_blueprints,
-message_store_id, static_key_from_arrow, static_key_from_msg}`, `MsgQueue::retain`
-(order-preserving, byte-exact), and the split `add_log_msg`
-blueprint-activation / static arms. Pinned by the fork tests
+message_store_id, static_key_from_arrow}`, `MsgQueue::retain` (order-preserving,
+byte-exact; F1 only), `StaticQueue` (the keyed `static_` queue, F2), and the
+split `add_log_msg` blueprint-activation / static arms. Pinned by the fork tests
 `drop_temporal_evicts_superseded_blueprint_stores`,
-`drop_temporal_blueprint_eviction_preserves_activation_ordering`, and
-`drop_temporal_dedups_static_relog_per_entity`.
+`drop_temporal_blueprint_eviction_preserves_activation_ordering`,
+`drop_temporal_dedups_static_relog_per_entity`, and the F2 follow-up tests
+listed below.
+
+### F2 follow-up — dedup keys cached at insert (no per-add re-decode)
+
+The original F2 found the prior static of an entity by running
+`MsgQueue::retain` over `static_` with a predicate that DECODED every buffered
+static (`to_application`: LZ4 decompress + Arrow IPC read) to compare its entity
+path against the arriving one. That is O(N) full decodes per static add — written
+for rare statics (a model, a `Transform3D`, a `Pinhole`), where N is tens.
+
+**Measured root cause (Go2 live view, macOS `sample` of `cerulion-vizd`).** Patch
+0006 of the Go2 runtime (`cerulion_viz::voxel_map`) logs every map tile
+`log_static` at ~2 Hz, so `static_` holds thousands of entries and every add
+re-decodes all of them: quadratic. vizd's `message_proxy_server` thread spent
+~100% of a core in `MessageBuffer::add_msg → MsgQueue::retain →
+static_key_from_arrow → re_log_encoding::transport_to_app::arrow_msg_transport_to_app`,
+vizd sat at ~105% CPU from a fresh start, the viewer fell minutes behind, and the
+Go2 model looked frozen although vizd's model binding was still submitting ~29
+joint frames/s and ~20 pose frames/s.
+
+Reproduced in the fork's own tests (debug profile, Apple Silicon; each phase adds
+N statics, the second phase re-logging the same N entities):
+
+| Code | N | first log (N distinct) | in-order re-log |
+|---|---|---|---|
+| pinned rev `29b3849` | 200 | 1.91 s | 3.82 s |
+| pinned rev `29b3849` | 400 | 7.52 s | 15.24 s |
+| pinned rev `29b3849` | 800 | 30.56 s | 60.63 s |
+| this fix | 2,000 | 0.19 s | 0.19 s (scattered order: 0.20 s) |
+
+The pinned rev quadruples per doubling of N (quadratic); the fix is flat per add
+(~100 µs, which is the ONE decode of the arriving message).
+
+**The fix.** `static_` is now a `StaticQueue`: the same arrival-ordered
+`VecDeque` with exact `size_bytes`, where each entry also carries its
+`(recording_id, entity_path)` key — computed ONCE when the message is buffered —
+and a `HashMap<key, seq>` index. Each entry has a strictly increasing insert
+number `seq`, so the superseded entry is found by one hash lookup plus one binary
+search on `seq` and removed with `VecDeque::remove` (O(1) when the producer
+re-logs in a stable order — the superseded entry is then at the front). No
+buffered payload is ever decoded again; `static_key_from_msg` (the re-decoder) is
+gone. Semantics are unchanged and pinned: latest-wins per `(store, entity)` with
+the re-logged entity moving to the back (exactly what `retain` + `push_back` did),
+exact byte accounting, decode failure → plain unkeyed append that never evicts
+and is never evicted by a keyed add, the index stays consistent under
+`pop_front` (the stock `gc()` drain), and stock mode (`drop_temporal == false`)
+never keys, never dedups, never decodes. F1 (`persistent`) is untouched;
+`message_store_id` reads proto fields only, so nothing left on the add path
+touches a buffered payload.
+
+Pinned by `drop_temporal_static_dedup_decodes_only_the_arriving_message` (2,000
+entities, logged then re-logged in order and in a scattered order: a test-only
+thread-local decode counter must read exactly one decode per add — 6,000 for
+6,000 adds), `drop_temporal_static_dedup_is_latest_wins_per_store_and_entity`,
+`drop_temporal_static_decode_failure_appends_and_never_evicts`,
+`drop_temporal_static_queue_stays_consistent_across_pop_front`, and
+`stock_mode_never_keys_or_dedups_statics`. Fork suite: 32/32.
+
+**Residual.** The transport `ArrowMsg` proto carries no entity path, so one
+decode of each ARRIVING static is still the floor for entity-level dedup. At
+vizd's map rates that is on the order of a few percent of a core, not a pegged
+one; if it ever matters, the next step is a schema-only IPC read (the entity path
+is schema metadata) rather than the full batch decode.
 
 `memory_limit` / `playback_behavior` semantics are **byte-identical to upstream
 when `drop_temporal_history == false`**. When the flag is set, the mode is

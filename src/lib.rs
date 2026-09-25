@@ -2,7 +2,7 @@
 
 pub mod shutdown;
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::net::SocketAddr;
 use std::pin::Pin;
 
@@ -827,11 +827,12 @@ impl MsgQueue {
         }
     }
 
-    /// CERULION PATCH (CER-858, F1/F2): retain only the messages for which `keep`
+    /// CERULION PATCH (CER-858, F1): retain only the messages for which `keep`
     /// returns `true`, preserving relative order and keeping [`Self::size_bytes`]
-    /// exact. Used by the drop-temporal eviction paths (superseded blueprints and
-    /// entity-level static dedup) — both of which run under the flag, where the
-    /// stock `gc()` is OFF.
+    /// exact. Used by the drop-temporal blueprint eviction path (`persistent`),
+    /// which runs under the flag, where the stock `gc()` is OFF. `keep` reads
+    /// proto fields only — it must never decode a buffered payload (see
+    /// [`StaticQueue`] for why).
     pub fn retain(&mut self, mut keep: impl FnMut(&LogOrTableMsgProto) -> bool) {
         let mut removed_bytes = 0u64;
         self.queue.retain(|msg| {
@@ -843,6 +844,125 @@ impl MsgQueue {
             }
         });
         self.size_bytes -= removed_bytes;
+    }
+}
+
+// -----------------------------------------------------------------------------------
+
+/// CERULION PATCH (CER-858, F2 follow-up): the dedup key of a static chunk —
+/// `(recording_id, entity_path)`.
+type StaticKey = (String, String);
+
+/// CERULION PATCH (CER-858, F2 follow-up): one buffered static chunk.
+struct StaticEntry {
+    /// Insert sequence number. Strictly increasing front-to-back, so the entry
+    /// holding a key can be located from [`StaticQueue::by_key`] by binary
+    /// search — never by re-reading (let alone re-decoding) its payload.
+    seq: u64,
+
+    /// The dedup key, computed ONCE at insert. `None` when the message is not
+    /// keyed: stock mode (`drop_temporal == false`), or a payload the key could
+    /// not be decoded from — a plain append either way, never a wrong-key drop.
+    key: Option<StaticKey>,
+
+    msg: LogOrTableMsgProto,
+}
+
+/// CERULION PATCH (CER-858, F2 follow-up): the `static_` queue — a [`MsgQueue`]
+/// whose entries carry their dedup key, computed ONCE at insert.
+///
+/// The original F2 found the prior static of an entity by DECODING every
+/// buffered static on every add (`MsgQueue::retain` calling `to_application` —
+/// decompress + Arrow IPC — per retained entry). That was written for rare
+/// statics; a producer that re-logs thousands of statics (`cerulion-vizd`'s
+/// voxel map logs every map tile `log_static` at ~2 Hz) makes it quadratic.
+/// Measured with macOS `sample` on the Go2 live view: vizd's
+/// `message_proxy_server` thread pegged at ~105% of a core in
+/// `MsgQueue::retain → static_key_from_arrow → arrow_msg_transport_to_app`
+/// from a fresh start, the viewer minutes behind, the robot model frozen while
+/// the binding still submitted ~29 joint frames/s.
+///
+/// Here an add is one hash lookup, one binary search and one `VecDeque::remove`
+/// (O(1) when the producer re-logs in a stable order, since the superseded entry
+/// is then at the front); no buffered payload is ever touched again.
+///
+/// Invariants: entries are in arrival order with strictly increasing `seq`;
+/// [`Self::size_bytes`] is the exact sum of the entries' `total_size_bytes()`;
+/// at most ONE entry is retained per key (latest-wins), and [`Self::by_key`]
+/// maps that key to exactly that entry's `seq`.
+#[derive(Default)]
+struct StaticQueue {
+    /// Messages stored in order of arrival.
+    entries: VecDeque<StaticEntry>,
+
+    /// Total size of the messages in [`Self::entries`] in bytes.
+    size_bytes: u64,
+
+    /// `key → seq` of the one retained entry holding that key.
+    by_key: HashMap<StaticKey, u64>,
+
+    /// The `seq` the next insert gets.
+    next_seq: u64,
+}
+
+impl StaticQueue {
+    pub fn iter(&self) -> impl DoubleEndedIterator<Item = &LogOrTableMsgProto> {
+        self.entries.iter().map(|entry| &entry.msg)
+    }
+
+    #[cfg(test)]
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    /// Append `msg`. With `Some(key)`, the prior entry holding `key` (if any) is
+    /// evicted first — latest-wins, exactly what F2's `retain` + `push_back` did,
+    /// minus the re-decode. With `None` this is a plain append that evicts
+    /// nothing.
+    pub fn push_back(&mut self, msg: LogOrTableMsgProto, key: Option<StaticKey>) {
+        if let Some(key) = &key
+            && let Some(old_seq) = self.by_key.get(key)
+        {
+            self.remove_seq(*old_seq);
+        }
+        let seq = self.next_seq;
+        self.next_seq += 1;
+        if let Some(key) = key.clone() {
+            self.by_key.insert(key, seq);
+        }
+        self.size_bytes += msg.total_size_bytes();
+        self.entries.push_back(StaticEntry { seq, key, msg });
+    }
+
+    pub fn pop_front(&mut self) -> Option<LogOrTableMsgProto> {
+        let entry = self.entries.pop_front()?;
+        self.size_bytes -= entry.msg.total_size_bytes();
+        self.forget_key(&entry);
+        Some(entry.msg)
+    }
+
+    /// Evict the entry with insert number `seq`, preserving the order of the rest
+    /// and keeping [`Self::size_bytes`] exact. Located by binary search on the
+    /// strictly increasing `seq`s. If no entry has that `seq` (an index
+    /// inconsistency this type never produces) nothing is removed — a leaked
+    /// entry is recoverable, a wrong-entry drop is not.
+    fn remove_seq(&mut self, seq: u64) {
+        let idx = self.entries.partition_point(|entry| entry.seq < seq);
+        let found = self.entries.get(idx).is_some_and(|entry| entry.seq == seq);
+        debug_assert!(found, "StaticQueue: seq {seq} is indexed but not buffered");
+        if found && let Some(entry) = self.entries.remove(idx) {
+            self.size_bytes -= entry.msg.total_size_bytes();
+            self.forget_key(&entry);
+        }
+    }
+
+    /// Drop the index entry pointing at `entry`, if it is the one it points at.
+    fn forget_key(&mut self, entry: &StaticEntry) {
+        if let Some(key) = &entry.key
+            && self.by_key.get(key) == Some(&entry.seq)
+        {
+            self.by_key.remove(key);
+        }
     }
 }
 
@@ -872,7 +992,11 @@ struct MessageBuffer {
     /// Ideally we would keep exactly one static message per entity/component stream
     /// (like the `ChunkStore` does), but we'll save that for:
     /// TODO(#5531): replace this with `ChunkStore`
-    static_: MsgQueue,
+    ///
+    /// CERULION PATCH (CER-858, F2): under [`Self::drop_temporal`] this holds
+    /// exactly one static message per `(store, entity)` — latest-wins — keyed
+    /// once at insert (see [`StaticQueue`]).
+    static_: StaticQueue,
 
     /// These are never garbage collected.
     persistent: MsgQueue,
@@ -883,6 +1007,16 @@ struct MessageBuffer {
     /// skeleton) with zero temporal replay. Set from
     /// [`ServerOptions::drop_temporal_history`].
     drop_temporal: bool,
+}
+
+// CERULION PATCH (CER-858, F2 follow-up): how many static-key decodes
+// (`to_application` on an arriving static's payload) the add path has run on
+// this thread. Test-only, compiled out of the shipped crate: the regression
+// test pins it to exactly ONE per static add — the arriving message — so a
+// buffered payload can never be re-decoded again without a test going red.
+#[cfg(test)]
+thread_local! {
+    static STATIC_KEY_DECODES: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
 
 impl MessageBuffer {
@@ -997,16 +1131,21 @@ impl MessageBuffer {
                     // `gc()` that would otherwise cap it is OFF under the flag).
                     // A decode failure yields `None` → plain append (never a
                     // wrong-key drop).
-                    let new_key = if self.drop_temporal {
+                    //
+                    // F2 follow-up: the key is decoded from the ARRIVING message
+                    // only — once — and cached with the entry by `StaticQueue`,
+                    // which finds the superseded entry by index. Nothing on this
+                    // path may decode a buffered payload: doing so per add is
+                    // O(N) decodes, quadratic under a producer that re-logs
+                    // thousands of statics (see `StaticQueue`).
+                    let key = if self.drop_temporal {
+                        #[cfg(test)]
+                        STATIC_KEY_DECODES.with(|count| count.set(count.get() + 1));
                         Self::static_key_from_arrow(inner)
                     } else {
                         None
                     };
-                    if let Some(new_key) = new_key {
-                        self.static_
-                            .retain(|m| Self::static_key_from_msg(m).as_ref() != Some(&new_key));
-                    }
-                    self.static_.push_back(msg.into());
+                    self.static_.push_back(msg.into(), key);
                 } else if !self.drop_temporal {
                     // Recording data (temporal). CERULION PATCH (CER-858): dropped
                     // (never buffered) when `drop_temporal` is set — the per-client
@@ -1054,10 +1193,13 @@ impl MessageBuffer {
     /// CERULION PATCH (CER-858, F2): the `(recording_id, entity_path)` a static
     /// chunk belongs to, or `None` if it is not a static chunk or the entity path
     /// cannot be extracted. Extraction requires decoding the arrow payload
-    /// (decompress + IPC schema) — done ONLY for the infrequent static path; a
-    /// decode failure returns `None` so the caller falls back to a plain append
-    /// (never a wrong-key drop).
-    fn static_key_from_arrow(arrow: &ArrowMsgProto) -> Option<(String, String)> {
+    /// (decompress + IPC schema): the transport proto carries no entity path, so
+    /// this is the one decode the dedup needs — and it runs ONCE per arriving
+    /// static (the F2 follow-up caches the result with the buffered entry; the
+    /// original F2 re-ran this on every buffered static per add). A decode
+    /// failure returns `None` so the caller falls back to a plain append (never
+    /// a wrong-key drop).
+    fn static_key_from_arrow(arrow: &ArrowMsgProto) -> Option<StaticKey> {
         if arrow.is_static != Some(true) {
             return None;
         }
@@ -1070,19 +1212,6 @@ impl MessageBuffer {
             .get(re_sorbet::metadata::SORBET_ENTITY_PATH)?
             .clone();
         Some((recording_id, entity_path))
-    }
-
-    /// CERULION PATCH (CER-858, F2): [`Self::static_key_from_arrow`] for a buffered
-    /// message (used to find the prior static of the same entity to evict).
-    fn static_key_from_msg(msg: &LogOrTableMsgProto) -> Option<(String, String)> {
-        let LogOrTableMsgProto::LogMsg(log_msg) = msg else {
-            return None;
-        };
-        use re_protos::log_msg::v1alpha1::log_msg::Msg;
-        let Some(Msg::ArrowMsg(arrow)) = log_msg.msg.as_ref() else {
-            return None;
-        };
-        Self::static_key_from_arrow(arrow)
     }
 
     pub fn gc(&mut self, max_bytes: u64) {
@@ -3158,7 +3287,7 @@ mod tests {
             "persistent must hold only the data SetStoreInfo + the LAST blueprint"
         );
         // Blueprints never land in static_/disposable.
-        assert_eq!(buffer.static_.queue.len(), 0);
+        assert_eq!(buffer.static_.len(), 0);
         assert_eq!(buffer.disposable.queue.len(), 0);
 
         // Store-attribution oracle: bp1/bp2 fully evicted; only `recording` + b3.
@@ -3260,7 +3389,7 @@ mod tests {
         buffer.add_msg(proto_of(&first));
         buffer.add_msg(proto_of(&second));
         assert_eq!(
-            buffer.static_.queue.len(),
+            buffer.static_.len(),
             1,
             "a same-entity static re-log must dedup to one chunk"
         );
@@ -3288,9 +3417,317 @@ mod tests {
         let other = static_msg_for_entity(&store, "robot/arm");
         buffer.add_msg(proto_of(&other));
         assert_eq!(
-            buffer.static_.queue.len(),
+            buffer.static_.len(),
             2,
             "statics for distinct entities must both be retained"
+        );
+    }
+
+    // CERULION PATCH (CER-858, F2 follow-up): the inner transport `Msg` of every
+    // retained static, in queue order.
+    fn static_inner_msgs(
+        buffer: &MessageBuffer,
+    ) -> Vec<re_protos::log_msg::v1alpha1::log_msg::Msg> {
+        buffer.static_.iter().map(inner_proto_msg).collect()
+    }
+
+    // CERULION PATCH (CER-858, F2 follow-up): the add path's static-key decode
+    // count on this thread, reset at the start of each test that pins it.
+    fn reset_static_key_decodes() {
+        STATIC_KEY_DECODES.with(|count| count.set(0));
+    }
+
+    fn static_key_decodes() -> u64 {
+        STATIC_KEY_DECODES.with(std::cell::Cell::get)
+    }
+
+    // CERULION PATCH (CER-858, F2 follow-up): a static chunk whose payload cannot
+    // be decoded (truncated LZ4 block), so the dedup key is unavailable.
+    fn corrupt_static_proto(store_id: &StoreId, entity: &str) -> LogOrTableMsgProto {
+        use re_protos::log_msg::v1alpha1::log_msg::Msg;
+        let mut proto = proto_of(&static_msg_for_entity(store_id, entity));
+        let LogOrTableMsgProto::LogMsg(log_msg) = &mut proto else {
+            panic!("expected a LogMsg variant");
+        };
+        let Some(Msg::ArrowMsg(arrow)) = log_msg.msg.as_mut() else {
+            panic!("expected an ArrowMsg");
+        };
+        arrow.payload = arrow.payload.slice(0..8);
+        proto
+    }
+
+    // CERULION PATCH (CER-858, F2 follow-up): the regression the follow-up exists
+    // for. The original F2 decoded EVERY buffered static on EVERY static add to
+    // find the one to replace — O(N) decodes per add, quadratic under a producer
+    // that re-logs thousands of statics (vizd's voxel map: every tile, ~2 Hz),
+    // measured pegging vizd at ~105% of a core. Pin: an add decodes exactly the
+    // arriving message, at 2,000 buffered entities, whichever order they are
+    // re-logged in — while the queue still holds exactly the latest of each.
+    #[test]
+    fn drop_temporal_static_dedup_decodes_only_the_arriving_message() {
+        reset_static_key_decodes();
+        const N: usize = 2_000;
+        let mut buffer = MessageBuffer {
+            drop_temporal: true,
+            ..Default::default()
+        };
+        let store = StoreId::random(StoreKind::Recording, "test_app");
+        let entity = |i: usize| format!("map/viz-cubes/t_{i}");
+        let protos = |order: &[usize]| -> Vec<LogOrTableMsgProto> {
+            order
+                .iter()
+                .map(|&i| proto_of(&static_msg_for_entity(&store, &entity(i))))
+                .collect()
+        };
+        let timed_adds = |buffer: &mut MessageBuffer, batch: &[LogOrTableMsgProto]| {
+            let t0 = std::time::Instant::now();
+            for p in batch {
+                buffer.add_msg(p.clone());
+            }
+            t0.elapsed()
+        };
+
+        // Phase 1: N DISTINCT entities. Each add decodes its own message: N.
+        let in_order: Vec<usize> = (0..N).collect();
+        let first = protos(&in_order);
+        let t_first = timed_adds(&mut buffer, &first);
+        assert_eq!(buffer.static_.len(), N);
+        assert_eq!(static_key_decodes(), N as u64);
+
+        // Phase 2: re-log all N in the SAME order (the producer's steady state).
+        // Under the original F2 this phase alone is N*N/2 = 2M decodes.
+        let relog = protos(&in_order);
+        let t_relog = timed_adds(&mut buffer, &relog);
+        assert_eq!(buffer.static_.len(), N, "latest-wins keeps exactly N");
+        assert_eq!(
+            static_key_decodes(),
+            2 * N as u64,
+            "a re-log must decode ONLY the arriving message, never the buffered ones"
+        );
+
+        // Phase 3: re-log all N in a SCATTERED order (7919 is prime, coprime with
+        // N), so the superseded entry sits anywhere in the queue.
+        let scattered: Vec<usize> = (0..N).map(|i| (i * 7919) % N).collect();
+        let last = protos(&scattered);
+        let t_scattered = timed_adds(&mut buffer, &last);
+        assert_eq!(buffer.static_.len(), N);
+        assert_eq!(static_key_decodes(), 3 * N as u64);
+
+        // Content + order: exactly the LAST re-log, in its arrival order.
+        let expected: Vec<_> = last.iter().map(inner_proto_msg).collect();
+        assert_eq!(static_inner_msgs(&buffer), expected);
+        let expected_bytes: u64 = last.iter().map(|m| m.total_size_bytes()).sum();
+        assert_eq!(buffer.static_.size_bytes, expected_bytes);
+        assert_eq!(buffer.static_.by_key.len(), N);
+
+        eprintln!(
+            "static dedup @ N={N}: first-log {t_first:?}, in-order re-log {t_relog:?}, \
+             scattered re-log {t_scattered:?} ({} decodes total)",
+            static_key_decodes()
+        );
+    }
+
+    // CERULION PATCH (CER-858, F2 follow-up): latest-wins semantics, byte-exact.
+    // The key is `(store, entity)`: the same entity path in ANOTHER store is a
+    // different key. A re-logged entity is evicted from where it sat and
+    // appended at the back — the order `all()` replays to a late joiner.
+    #[test]
+    fn drop_temporal_static_dedup_is_latest_wins_per_store_and_entity() {
+        let mut buffer = MessageBuffer {
+            drop_temporal: true,
+            ..Default::default()
+        };
+        let store_a = StoreId::random(StoreKind::Recording, "test_app");
+        let store_b = StoreId::random(StoreKind::Recording, "test_app");
+
+        let a_base = proto_of(&static_msg_for_entity(&store_a, "robot/base"));
+        let a_arm = proto_of(&static_msg_for_entity(&store_a, "robot/arm"));
+        let b_base = proto_of(&static_msg_for_entity(&store_b, "robot/base"));
+        for m in [&a_base, &a_arm, &b_base] {
+            buffer.add_msg(m.clone());
+        }
+        assert_eq!(
+            buffer.static_.len(),
+            3,
+            "three distinct (store, entity) keys"
+        );
+
+        // Re-log A/robot/base: A's prior is replaced; B's same-path static is not.
+        let a_base_2 = proto_of(&static_msg_for_entity(&store_a, "robot/base"));
+        buffer.add_msg(a_base_2.clone());
+        assert_eq!(buffer.static_.len(), 3);
+        let expected: Vec<_> = [&a_arm, &b_base, &a_base_2]
+            .iter()
+            .map(|m| inner_proto_msg(m))
+            .collect();
+        assert_eq!(
+            static_inner_msgs(&buffer),
+            expected,
+            "the re-logged entity moves to the back; the other store's same path survives"
+        );
+        assert!(
+            !static_inner_msgs(&buffer).contains(&inner_proto_msg(&a_base)),
+            "the superseded static must be gone"
+        );
+        let expected_bytes: u64 = [&a_arm, &b_base, &a_base_2]
+            .iter()
+            .map(|m| m.total_size_bytes())
+            .sum();
+        assert_eq!(buffer.static_.size_bytes, expected_bytes);
+
+        // Re-log it again: still three, and it stays at the back.
+        let a_base_3 = proto_of(&static_msg_for_entity(&store_a, "robot/base"));
+        buffer.add_msg(a_base_3.clone());
+        assert_eq!(buffer.static_.len(), 3);
+        assert_eq!(
+            static_inner_msgs(&buffer).last(),
+            Some(&inner_proto_msg(&a_base_3))
+        );
+
+        // `all()` replays statics in that exact order (and reversed for NewestFirst).
+        let oldest: Vec<_> = buffer
+            .all(PlaybackBehavior::OldestFirst)
+            .iter()
+            .map(inner_proto_msg)
+            .collect();
+        assert_eq!(oldest, static_inner_msgs(&buffer));
+        let newest: Vec<_> = buffer
+            .all(PlaybackBehavior::NewestFirst)
+            .iter()
+            .map(inner_proto_msg)
+            .collect();
+        let mut reversed = static_inner_msgs(&buffer);
+        reversed.reverse();
+        assert_eq!(newest, reversed);
+    }
+
+    // CERULION PATCH (CER-858, F2 follow-up): a static whose key cannot be decoded
+    // is a plain append — it evicts nothing, is never evicted by a later keyed
+    // add, and re-sending it appends again. Never a wrong-key drop.
+    #[test]
+    fn drop_temporal_static_decode_failure_appends_and_never_evicts() {
+        reset_static_key_decodes();
+        let mut buffer = MessageBuffer {
+            drop_temporal: true,
+            ..Default::default()
+        };
+        let store = StoreId::random(StoreKind::Recording, "test_app");
+
+        let keyed = proto_of(&static_msg_for_entity(&store, "robot/base"));
+        buffer.add_msg(keyed.clone());
+        let corrupt_1 = corrupt_static_proto(&store, "robot/base");
+        let corrupt_2 = corrupt_static_proto(&store, "robot/base");
+        buffer.add_msg(corrupt_1.clone());
+        buffer.add_msg(corrupt_2.clone());
+        assert_eq!(
+            buffer.static_.len(),
+            3,
+            "undecodable statics are appended, never deduped"
+        );
+        assert_eq!(
+            static_key_decodes(),
+            3,
+            "each add tried to decode exactly itself"
+        );
+        assert_eq!(
+            buffer.static_.by_key.len(),
+            1,
+            "only the decodable static is keyed"
+        );
+
+        // A keyed re-log replaces ONLY the keyed prior; the corrupt ones survive.
+        let keyed_2 = proto_of(&static_msg_for_entity(&store, "robot/base"));
+        buffer.add_msg(keyed_2.clone());
+        let expected: Vec<_> = [&corrupt_1, &corrupt_2, &keyed_2]
+            .iter()
+            .map(|m| inner_proto_msg(m))
+            .collect();
+        assert_eq!(static_inner_msgs(&buffer), expected);
+        let expected_bytes: u64 = [&corrupt_1, &corrupt_2, &keyed_2]
+            .iter()
+            .map(|m| m.total_size_bytes())
+            .sum();
+        assert_eq!(buffer.static_.size_bytes, expected_bytes);
+    }
+
+    // CERULION PATCH (CER-858, F2 follow-up): the key index stays consistent when
+    // the queue is drained from the front (the stock `gc()` path — OFF under the
+    // flag, but the type must not depend on that). After a pop, re-logging the
+    // popped entity is a plain append, and re-logging a survivor still dedups.
+    #[test]
+    fn drop_temporal_static_queue_stays_consistent_across_pop_front() {
+        let mut buffer = MessageBuffer {
+            drop_temporal: true,
+            ..Default::default()
+        };
+        let store = StoreId::random(StoreKind::Recording, "test_app");
+        for entity in ["a", "b", "c"] {
+            buffer.add_msg(proto_of(&static_msg_for_entity(&store, entity)));
+        }
+        let popped = buffer.static_.pop_front().expect("three entries buffered");
+        assert_eq!(buffer.static_.len(), 2);
+        assert_eq!(
+            buffer.static_.by_key.len(),
+            2,
+            "the popped entry's key is unindexed"
+        );
+
+        // "a" is gone: re-logging it appends (nothing to replace) → [b, c, a].
+        let a_2 = proto_of(&static_msg_for_entity(&store, "a"));
+        buffer.add_msg(a_2.clone());
+        assert_eq!(buffer.static_.len(), 3);
+        assert_eq!(
+            static_inner_msgs(&buffer).last(),
+            Some(&inner_proto_msg(&a_2))
+        );
+        assert!(!static_inner_msgs(&buffer).contains(&inner_proto_msg(&popped)));
+
+        // "b" survived the pop: re-logging it still replaces → [c, a, b].
+        let b_2 = proto_of(&static_msg_for_entity(&store, "b"));
+        buffer.add_msg(b_2.clone());
+        assert_eq!(buffer.static_.len(), 3);
+        assert_eq!(
+            static_inner_msgs(&buffer).last(),
+            Some(&inner_proto_msg(&b_2))
+        );
+        assert_eq!(buffer.static_.by_key.len(), 3);
+
+        // Draining everything through the stock `gc()` empties the index too.
+        buffer.gc(0);
+        assert_eq!(buffer.static_.len(), 0);
+        assert_eq!(buffer.static_.size_bytes, 0);
+        assert!(buffer.static_.by_key.is_empty());
+    }
+
+    // CERULION PATCH (CER-858, F2 follow-up): stock mode is untouched — statics
+    // are appended as upstream does (no dedup) and NOTHING is decoded.
+    #[test]
+    fn stock_mode_never_keys_or_dedups_statics() {
+        reset_static_key_decodes();
+        let mut buffer = MessageBuffer::default();
+        let store = StoreId::random(StoreKind::Recording, "test_app");
+        let first = proto_of(&static_msg_for_entity(&store, "robot/base"));
+        let second = proto_of(&static_msg_for_entity(&store, "robot/base"));
+        buffer.add_msg(first.clone());
+        buffer.add_msg(second.clone());
+        assert_eq!(
+            buffer.static_.len(),
+            2,
+            "upstream appends same-entity statics"
+        );
+        assert_eq!(
+            static_key_decodes(),
+            0,
+            "stock mode never decodes a payload"
+        );
+        assert!(buffer.static_.by_key.is_empty());
+        assert_eq!(
+            static_inner_msgs(&buffer),
+            vec![inner_proto_msg(&first), inner_proto_msg(&second)]
+        );
+        assert_eq!(
+            buffer.static_.size_bytes,
+            first.total_size_bytes() + second.total_size_bytes()
         );
     }
 
