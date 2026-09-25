@@ -1010,10 +1010,14 @@ struct MessageBuffer {
 }
 
 // CERULION PATCH (CER-858, F2 follow-up): how many static-key decodes
-// (`to_application` on an arriving static's payload) the add path has run on
-// this thread. Test-only, compiled out of the shipped crate: the regression
-// test pins it to exactly ONE per static add — the arriving message — so a
-// buffered payload can never be re-decoded again without a test going red.
+// (`to_application` on a static's payload) have run on this thread. Bumped
+// inside `static_key_from_arrow` right before the decode — not at a call
+// site — so every decode is counted whoever asks for it. Test-only, compiled
+// out of the shipped crate: the regression test pins it to exactly ONE per
+// static add — the arriving message — so a buffered payload can never be
+// re-decoded again without a test going red (the pinned rev's per-add
+// `retain` re-decode reads 20,100 for the first log of 200 distinct
+// entities alone — 200 + 200·199/2 — and 60,300 once they are re-logged).
 #[cfg(test)]
 thread_local! {
     static STATIC_KEY_DECODES: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
@@ -1139,8 +1143,6 @@ impl MessageBuffer {
                     // O(N) decodes, quadratic under a producer that re-logs
                     // thousands of statics (see `StaticQueue`).
                     let key = if self.drop_temporal {
-                        #[cfg(test)]
-                        STATIC_KEY_DECODES.with(|count| count.set(count.get() + 1));
                         Self::static_key_from_arrow(inner)
                     } else {
                         None
@@ -1204,6 +1206,11 @@ impl MessageBuffer {
             return None;
         }
         let recording_id = arrow.store_id.as_ref()?.recording_id.clone();
+        // The counter lives HERE, at the decode itself, not at any call site:
+        // whoever decodes a static payload (any future re-decoder of buffered
+        // entries included) is counted, so the one-decode-per-add pin holds.
+        #[cfg(test)]
+        STATIC_KEY_DECODES.with(|count| count.set(count.get() + 1));
         let app = arrow.to_application(()).ok()?;
         let entity_path = app
             .batch
@@ -3431,8 +3438,9 @@ mod tests {
         buffer.static_.iter().map(inner_proto_msg).collect()
     }
 
-    // CERULION PATCH (CER-858, F2 follow-up): the add path's static-key decode
-    // count on this thread, reset at the start of each test that pins it.
+    // CERULION PATCH (CER-858, F2 follow-up): the static-key decode count on
+    // this thread (bumped in the decoder itself, so it sees every caller),
+    // reset at the start of each test that pins it.
     fn reset_static_key_decodes() {
         STATIC_KEY_DECODES.with(|count| count.set(0));
     }

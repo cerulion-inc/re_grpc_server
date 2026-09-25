@@ -158,7 +158,16 @@ touches a buffered payload.
 Pinned by `drop_temporal_static_dedup_decodes_only_the_arriving_message` (2,000
 entities, logged then re-logged in order and in a scattered order: a test-only
 thread-local decode counter must read exactly one decode per add — 6,000 for
-6,000 adds), `drop_temporal_static_dedup_is_latest_wins_per_store_and_entity`,
+6,000 adds). The counter sits IN the decoder — `static_key_from_arrow`, right
+before `to_application` — not at the add-path call site, so any code that
+decodes a buffered payload is counted whoever calls it. Measured by porting the
+counter and an N=200 log-twice pin onto the pinned rev `29b3849`: with the
+counter at the call site the per-add `retain` re-decode is invisible and the
+pin PASSES (200 decodes after the first log, 400 after the re-log — while
+taking 1.90 s and 3.80 s); with the counter in the decoder the same pin goes
+RED at the first log alone (20,100 decodes = 200 + 200·199/2; 60,300 after the
+re-log). Also
+`drop_temporal_static_dedup_is_latest_wins_per_store_and_entity`,
 `drop_temporal_static_decode_failure_appends_and_never_evicts`,
 `drop_temporal_static_queue_stays_consistent_across_pop_front`, and
 `stock_mode_never_keys_or_dedups_statics`. Fork suite: 32/32.
