@@ -2,9 +2,10 @@
 
 This repository (`cerulion-inc/re_grpc_server`) is a **sparse crate fork** of
 **upstream `re_grpc_server` 0.34.1** (from `rerun-io/rerun`, exactly as published
-to crates.io) **plus one localized patch**. It is pinned into `cerulion-base` via
+to crates.io) **plus one localized patch**. It is pinned into `cerulion`
+(github.com/cerulion-inc/cerulion) via
 the root `Cargo.toml` `[patch.crates-io]` git rev (the `cerulion-inc/RustDDS` fork
-precedent) and allow-listed in `cerulion-base`'s `deny.toml [sources]`.
+precedent) and allow-listed in `cerulion`'s `deny.toml [sources]`.
 
 The `upstream` branch holds the crates.io 0.34.1 tarball verbatim; `main` is
 `upstream` plus the patch. See `README.md` for the branch model and the

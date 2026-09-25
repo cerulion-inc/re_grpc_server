@@ -9,7 +9,7 @@ producer bandwidth). Tracked in **CER-858**. The full delta is in
 [`CERULION-PATCH.md`](./CERULION-PATCH.md).
 
 This is a *single-crate* fork (one crate at the repo root), not a fork of the
-whole rerun monorepo. It is consumed by `cerulion-base` as a `git`
+whole rerun monorepo. It is consumed by `cerulion` (github.com/cerulion-inc/cerulion) as a `git`
 `[patch.crates-io]` pin (the `cerulion-inc/RustDDS` precedent), keeping cold-CI
 git-clone weight to this one small crate instead of rerun's ~278 MB monorepo.
 
@@ -18,7 +18,7 @@ git-clone weight to this one small crate instead of rerun's ~278 MB monorepo.
 | Branch | Contents |
 |---|---|
 | `upstream` | The crates.io `re_grpc_server` 0.34.1 tarball **verbatim** at repo root (packaging artifacts `.cargo_vcs_info.json` / `Cargo.toml.orig` stripped). Tagged `upstream/<version>`. |
-| `main` | `upstream` + the Cerulion patch. This is the branch `cerulion-base` pins. |
+| `main` | `upstream` + the Cerulion patch. This is the branch `cerulion` pins. |
 
 Keeping the pristine upstream tree on its own branch makes the Cerulion delta a
 reviewable `git diff upstream..main` and makes version bumps a clean merge.
@@ -33,7 +33,7 @@ reviewable `git diff upstream..main` and makes version bumps a clean merge.
 git checkout main
 git merge upstream
 
-# 3. Rebuild + retest, then update the pinned rev in cerulion-base's
+# 3. Rebuild + retest, then update the pinned rev in cerulion's
 #    root Cargo.toml [patch.crates-io].
 ```
 
@@ -42,7 +42,7 @@ replaces the tree on the `upstream` branch, commits, and tags `upstream/<version
 
 ## Exit condition
 
-Drop this fork (revert `cerulion-base` to the crates.io `re_grpc_server`) if
+Drop this fork (revert `cerulion` to the crates.io `re_grpc_server`) if
 upstream ever ships a statics-only / drop-temporal history mode. See
 `CERULION-PATCH.md`.
 
