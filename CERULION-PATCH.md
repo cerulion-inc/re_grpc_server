@@ -2,9 +2,10 @@
 
 This repository (`cerulion-inc/re_grpc_server`) is a **sparse crate fork** of
 **upstream `re_grpc_server` 0.34.1** (from `rerun-io/rerun`, exactly as published
-to crates.io) **plus one localized patch**. It is pinned into `cerulion-base` via
+to crates.io) **plus one localized patch**. It is pinned into `cerulion`
+(github.com/cerulion-inc/cerulion) via
 the root `Cargo.toml` `[patch.crates-io]` git rev (the `cerulion-inc/RustDDS` fork
-precedent) and allow-listed in `cerulion-base`'s `deny.toml [sources]`.
+precedent) and allow-listed in `cerulion`'s `deny.toml [sources]`.
 
 The `upstream` branch holds the crates.io 0.34.1 tarball verbatim; `main` is
 `upstream` plus the patch. See `README.md` for the branch model and the
@@ -90,7 +91,7 @@ bound**, so both are bounded at buffer time — **ONLY under the flag**; with
 | # | Unbounded path | Fix |
 |---|---|---|
 | F1 | `persistent` grows on every Studio `set_blueprint`: each layout change mints a **FRESH blueprint store**, and every new client would replay ALL superseded blueprints. | When a `BlueprintActivationCommand` for blueprint `B` is buffered, evict from `persistent` every message belonging to a Blueprint-KIND store ≠ `B` (its `SetStoreInfo`, chunks, and stale activation commands), preserving relative order + exact `size_bytes`. A recording-data `SetStoreInfo` is **not** blueprint-kind, so it always survives. Keyed on the blueprint store's `recording_id` (its unique uuid). Gated on the flag — stock upstream keeps every blueprint (the flag's owner activates each new blueprint `make_active`, so "activated = supersedes prior" is exact for Studio). |
-| F2 | `static_` grows on every reconnect: a reconnecting client re-logs the same statics, appending duplicates. | A static `ArrowMsg` for entity `E` **REPLACES** the prior retained static for the same `(store_id, E)` (latest-wins, matching rerun's own static semantics) instead of appending. The entity path is decoded from the arrow payload (`ArrowMsg::to_application` → the batch schema's `rerun:entity_path` metadata) **only on the infrequent static path**; a decode failure falls back to a plain append (never a wrong-key drop). |
+| F2 | `static_` grows on every reconnect: a reconnecting client re-logs the same statics, appending duplicates. | A static `ArrowMsg` for entity `E` **REPLACES** the prior retained static for the same `(store_id, E)` (latest-wins, matching rerun's own static semantics) instead of appending. The entity path is decoded from the arrow payload (`ArrowMsg::to_application` → the batch schema's `rerun:entity_path` metadata) **once, when the chunk is buffered**, and cached beside it (see *F2 perf* below); a decode failure falls back to a plain append (never a wrong-key drop). |
 
 > **F2 caveat.** Replacement is **entity-level**: logging DIFFERENT component sets
 > statically to the SAME entity across sends would drop the earlier components.
@@ -99,12 +100,47 @@ bound**, so both are bounded at buffer time — **ONLY under the flag**; with
 > with no loss.
 
 Files: all in `src/lib.rs` — `MessageBuffer::{evict_superseded_blueprints,
-message_store_id, static_key_from_arrow, static_key_from_msg}`, `MsgQueue::retain`
-(order-preserving, byte-exact), and the split `add_log_msg`
-blueprint-activation / static arms. Pinned by the fork tests
+message_store_id, static_key_from_arrow}`, `MsgQueue::{retain, push_back_keyed}`
+(order-preserving, byte-exact), the `QueuedMsg` / `StaticKey` queue entry, and the
+split `add_log_msg` blueprint-activation / static arms. Pinned by the fork tests
 `drop_temporal_evicts_superseded_blueprint_stores`,
-`drop_temporal_blueprint_eviction_preserves_activation_ordering`, and
-`drop_temporal_dedups_static_relog_per_entity`.
+`drop_temporal_blueprint_eviction_preserves_activation_ordering`,
+`drop_temporal_dedups_static_relog_per_entity`, and
+`drop_temporal_static_dedup_uses_the_key_cached_at_insert`.
+
+### F2 perf — the dedup key is cached at insert (2026-09-25)
+
+The original F2 (`06d307c`) found the prior same-entity static by calling
+`static_key_from_msg` on **every** buffered static on each new static insert.
+That fully decodes each buffered chunk (LZ4 decompress + Arrow IPC decode), so one
+static insert cost one full decode per buffered static — quadratic in the number
+of buffered statics. The "infrequent static path" assumption does not hold for a
+producer that draws a map as hundreds of per-tile statics re-logged at up to 2 Hz.
+
+Measured on `cerulion-vizd` serving a live voxel map (macOS `sample`): the
+single-threaded `message_proxy_server` thread spent 99% of its samples in
+`MessageBuffer::add_msg → MsgQueue::retain → static_key_from_arrow →
+arrow_msg_transport_to_app`, and the viewer fell ~30 s behind live. Network was not
+the cause (0.69 Mbit/s).
+
+Fix: `MsgQueue` stores `QueuedMsg { msg, static_key }`. The key is computed ONCE,
+for the incoming chunk, and stored with it (`push_back_keyed`); eviction compares
+the cached keys. The only decode per static insert is the new message's own.
+`static_key_from_msg` is deleted. Latest-wins per `(recording_id, entity_path)`,
+byte accounting, and ordering are unchanged; a chunk whose key could not be
+decoded at insert is cached as `None` and, as before, is never evicted by dedup.
+With `drop_temporal_history == false` no key is computed and nothing changes.
+
+| | Before | After |
+|---|---|---|
+| `message_proxy_server` thread | 99% of samples in the re-decode path | ~98% parked (idle) |
+| Viewer lag behind live | ~30 s | none observed; 0 "viewer is not consuming" drop warnings, all topics 0 frames missed |
+| `cerulion-vizd` total CPU | not recorded | 18%, including an H.264 camera stream |
+
+`drop_temporal_static_dedup_uses_the_key_cached_at_insert` corrupts the buffered
+chunk's payload after insert, so an implementation that re-decodes buffered chunks
+can no longer recover the key and fails to dedup. Mutation-verified: restoring the
+re-decode fails exactly this test.
 
 `memory_limit` / `playback_behavior` semantics are **byte-identical to upstream
 when `drop_temporal_history == false`**. When the flag is set, the mode is
