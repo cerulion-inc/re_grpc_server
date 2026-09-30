@@ -13,10 +13,11 @@
 #      .cargo_vcs_info.json / Cargo.toml.orig).
 #   3. Commits and tags `upstream/<VERSION>`.
 #
-# After this, bring the Cerulion patch forward:
+# After this, bring the Cerulion patches forward:
 #   git checkout main && git merge upstream
 # (resolve any conflicts in src/lib.rs), rebuild, retest, and update the pinned
-# rev in cerulion-base's root Cargo.toml [patch.crates-io]. See CERULION-PATCH.md.
+# rev in cerulion's (github.com/cerulion-inc/cerulion) root Cargo.toml
+# [patch.crates-io]. See CERULION-PATCH.md.
 
 set -euo pipefail
 

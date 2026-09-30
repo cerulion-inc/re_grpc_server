@@ -799,10 +799,22 @@ impl From<DataSourceUiCommand> for LogOrTableMsgProto {
 
 // -----------------------------------------------------------------------------------
 
+/// CERULION PATCH (CER-858, F2 perf): the `(recording_id, entity_path)` a buffered
+/// static chunk belongs to. Computed ONCE, when the chunk is buffered, and stored
+/// beside it, so a later same-entity dedup compares strings instead of
+/// re-decoding (decompress + Arrow IPC) every buffered static.
+type StaticKey = (String, String);
+
+/// A buffered message plus its static dedup key, when it has one.
+struct QueuedMsg {
+    msg: LogOrTableMsgProto,
+    static_key: Option<StaticKey>,
+}
+
 #[derive(Default)]
 struct MsgQueue {
     /// Messages stored in order of arrival, and garbage collected if the server hits the memory limit.
-    queue: VecDeque<LogOrTableMsgProto>,
+    queue: VecDeque<QueuedMsg>,
 
     /// Total size of [`Self::queue`] in bytes.
     size_bytes: u64,
@@ -810,18 +822,24 @@ struct MsgQueue {
 
 impl MsgQueue {
     pub fn iter(&self) -> impl DoubleEndedIterator<Item = &LogOrTableMsgProto> {
-        self.queue.iter()
+        self.queue.iter().map(|q| &q.msg)
     }
 
     pub fn push_back(&mut self, msg: LogOrTableMsgProto) {
+        self.push_back_keyed(msg, None);
+    }
+
+    /// CERULION PATCH (CER-858, F2 perf): push `msg` with its precomputed static
+    /// dedup key (see [`StaticKey`]).
+    pub fn push_back_keyed(&mut self, msg: LogOrTableMsgProto, static_key: Option<StaticKey>) {
         self.size_bytes += msg.total_size_bytes();
-        self.queue.push_back(msg);
+        self.queue.push_back(QueuedMsg { msg, static_key });
     }
 
     pub fn pop_front(&mut self) -> Option<LogOrTableMsgProto> {
-        if let Some(msg) = self.queue.pop_front() {
-            self.size_bytes -= msg.total_size_bytes();
-            Some(msg)
+        if let Some(q) = self.queue.pop_front() {
+            self.size_bytes -= q.msg.total_size_bytes();
+            Some(q.msg)
         } else {
             None
         }
@@ -832,13 +850,13 @@ impl MsgQueue {
     /// exact. Used by the drop-temporal eviction paths (superseded blueprints and
     /// entity-level static dedup) — both of which run under the flag, where the
     /// stock `gc()` is OFF.
-    pub fn retain(&mut self, mut keep: impl FnMut(&LogOrTableMsgProto) -> bool) {
+    pub fn retain(&mut self, mut keep: impl FnMut(&QueuedMsg) -> bool) {
         let mut removed_bytes = 0u64;
-        self.queue.retain(|msg| {
-            if keep(msg) {
+        self.queue.retain(|q| {
+            if keep(q) {
                 true
             } else {
-                removed_bytes += msg.total_size_bytes();
+                removed_bytes += q.msg.total_size_bytes();
                 false
             }
         });
@@ -1002,11 +1020,15 @@ impl MessageBuffer {
                     } else {
                         None
                     };
-                    if let Some(new_key) = new_key {
+                    // CERULION PATCH (CER-858, F2 perf): compare the CACHED key of
+                    // each buffered static; decoding them all again on every
+                    // static insert made this quadratic in the buffered statics
+                    // (a live voxel map re-logs hundreds of per-tile statics).
+                    if let Some(new_key) = &new_key {
                         self.static_
-                            .retain(|m| Self::static_key_from_msg(m).as_ref() != Some(&new_key));
+                            .retain(|q| q.static_key.as_ref() != Some(new_key));
                     }
-                    self.static_.push_back(msg.into());
+                    self.static_.push_back_keyed(msg.into(), new_key);
                 } else if !self.drop_temporal {
                     // Recording data (temporal). CERULION PATCH (CER-858): dropped
                     // (never buffered) when `drop_temporal` is set — the per-client
@@ -1042,7 +1064,7 @@ impl MessageBuffer {
     fn evict_superseded_blueprints(&mut self, active: &StoreIdProto) {
         let keep_recording_id = &active.recording_id;
         self.persistent
-            .retain(|msg| match Self::message_store_id(msg) {
+            .retain(|q| match Self::message_store_id(&q.msg) {
                 Some(id) if id.kind() == StoreKindProto::Blueprint => {
                     &id.recording_id == keep_recording_id
                 }
@@ -1054,9 +1076,10 @@ impl MessageBuffer {
     /// CERULION PATCH (CER-858, F2): the `(recording_id, entity_path)` a static
     /// chunk belongs to, or `None` if it is not a static chunk or the entity path
     /// cannot be extracted. Extraction requires decoding the arrow payload
-    /// (decompress + IPC schema) — done ONLY for the infrequent static path; a
-    /// decode failure returns `None` so the caller falls back to a plain append
-    /// (never a wrong-key drop).
+    /// (decompress + IPC schema) — done ONCE per static insert, for the incoming
+    /// chunk only, and cached beside it (`QueuedMsg::static_key`); a decode
+    /// failure returns `None` so the caller falls back to a plain append (never a
+    /// wrong-key drop).
     fn static_key_from_arrow(arrow: &ArrowMsgProto) -> Option<(String, String)> {
         if arrow.is_static != Some(true) {
             return None;
@@ -1070,19 +1093,6 @@ impl MessageBuffer {
             .get(re_sorbet::metadata::SORBET_ENTITY_PATH)?
             .clone();
         Some((recording_id, entity_path))
-    }
-
-    /// CERULION PATCH (CER-858, F2): [`Self::static_key_from_arrow`] for a buffered
-    /// message (used to find the prior static of the same entity to evict).
-    fn static_key_from_msg(msg: &LogOrTableMsgProto) -> Option<(String, String)> {
-        let LogOrTableMsgProto::LogMsg(log_msg) = msg else {
-            return None;
-        };
-        use re_protos::log_msg::v1alpha1::log_msg::Msg;
-        let Some(Msg::ArrowMsg(arrow)) = log_msg.msg.as_ref() else {
-            return None;
-        };
-        Self::static_key_from_arrow(arrow)
     }
 
     pub fn gc(&mut self, max_bytes: u64) {
@@ -3291,6 +3301,55 @@ mod tests {
             buffer.static_.queue.len(),
             2,
             "statics for distinct entities must both be retained"
+        );
+    }
+
+    // CERULION PATCH (CER-858, F2 perf): the static dedup key is computed ONCE,
+    // when a chunk is buffered, and the eviction compares that cached key. It must
+    // never re-decode the buffered chunks: that made every static insert cost one
+    // full decode per buffered static, quadratic in the statics a live voxel map
+    // re-logs, and put a 30 s backlog in front of the viewer. Discriminator: the
+    // buffered chunk's payload is corrupted AFTER insert, so a re-decoding
+    // implementation can no longer recover its key and fails to dedup.
+    #[test]
+    fn drop_temporal_static_dedup_uses_the_key_cached_at_insert() {
+        let mut buffer = MessageBuffer {
+            drop_temporal: true,
+            ..Default::default()
+        };
+        let store = StoreId::random(StoreKind::Recording, "test_app");
+        buffer.add_msg(proto_of(&static_msg_for_entity(&store, "robot/base")));
+
+        let cached = buffer.static_.queue[0].static_key.clone();
+        assert_eq!(
+            cached,
+            Some((store.recording_id().to_string(), "/robot/base".to_owned())),
+            "the key must be cached at insert"
+        );
+
+        // Corrupt the buffered payload in place: undecodable from here on.
+        {
+            use re_protos::log_msg::v1alpha1::log_msg::Msg;
+            let LogOrTableMsgProto::LogMsg(log_msg) = &mut buffer.static_.queue[0].msg else {
+                panic!("expected a LogMsg");
+            };
+            let Some(Msg::ArrowMsg(arrow)) = log_msg.msg.as_mut() else {
+                panic!("expected an ArrowMsg");
+            };
+            arrow.payload = b"not an arrow payload".to_vec().into();
+        }
+
+        let relog = static_msg_for_entity(&store, "robot/base");
+        buffer.add_msg(proto_of(&relog));
+        assert_eq!(
+            buffer.static_.queue.len(),
+            1,
+            "the re-log must evict the prior chunk by its CACHED key, without decoding it"
+        );
+        assert_eq!(
+            inner_proto_msg(buffer.static_.iter().next().unwrap()),
+            inner_proto_msg(&proto_of(&relog)),
+            "the retained static must be the re-log"
         );
     }
 
