@@ -3,9 +3,9 @@
 This repository (`cerulion-inc/re_grpc_server`) is a **sparse crate fork** of
 **upstream `re_grpc_server` 0.34.1** (from `rerun-io/rerun`, exactly as published
 to crates.io) **plus one localized patch**. It is pinned into `cerulion`
-(github.com/cerulion-inc/cerulion) via
-the root `Cargo.toml` `[patch.crates-io]` git rev (the `cerulion-inc/RustDDS` fork
-precedent) and allow-listed in `cerulion`'s `deny.toml [sources]`.
+(github.com/cerulion-inc/cerulion) via the root `Cargo.toml` `[patch.crates-io]`
+git rev (the `cerulion-inc/RustDDS` fork precedent) and allow-listed in the
+`[sources] allow-git` list of `cerulion`'s `tools/release/deny.toml`.
 
 The `upstream` branch holds the crates.io 0.34.1 tarball verbatim; `main` is
 `upstream` plus the patch. See `README.md` for the branch model and the
@@ -347,7 +347,8 @@ behaviour this patch exists to remove.
 ## Exit condition
 
 Drop this fork entirely (revert to the crates.io `re_grpc_server`, prune the
-`[patch.crates-io]` rev and the `deny.toml [sources]` entry) if upstream
+`[patch.crates-io]` rev and the `[sources] allow-git` entry in cerulion's
+`tools/release/deny.toml`) if upstream
 `re_grpc_server` ever ships BOTH a statics-only / drop-temporal history mode
 (CER-858) and a bounded, non-blocking live queue (CER-959). Upstream already
 carries a `TODO(emilk)` to move `CHANNEL_SIZE_MESSAGES`/`CHANNEL_SIZE_BYTES` into
