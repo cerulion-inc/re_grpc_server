@@ -2,13 +2,13 @@
 
 This repository (`cerulion-inc/re_grpc_server`) is a **sparse crate fork** of
 **upstream `re_grpc_server` 0.34.1** (from `rerun-io/rerun`, exactly as published
-to crates.io) **plus one localized patch**. It is pinned into `cerulion`
+to crates.io) **plus two localized patches**. It is pinned into `cerulion`
 (github.com/cerulion-inc/cerulion) via the root `Cargo.toml` `[patch.crates-io]`
-git rev (the `cerulion-inc/RustDDS` fork precedent) and allow-listed in the
-`[sources] allow-git` list of `cerulion`'s `tools/release/deny.toml`.
+git rev and allow-listed in the `[sources] allow-git` list of `cerulion`'s
+`tools/release/deny.toml`.
 
 The `upstream` branch holds the crates.io 0.34.1 tarball verbatim; `main` is
-`upstream` plus the patch. See `README.md` for the branch model and the
+`upstream` plus both patches. See `README.md` for the branch model and the
 `./import-upstream.sh` upgrade procedure.
 
 ## Why a fork
@@ -42,7 +42,7 @@ accumulates unboundedly in every viewer's chunk store.
 The connect-history is already the correct **per-client, once-per-connect**
 delivery mechanism — it just needs to carry statics-only. That is this patch.
 
-## The patch (delta vs upstream 0.34.1)
+## Patch 1 (CER-858): `drop_temporal_history`, the replay history
 
 A new `ServerOptions` field `drop_temporal_history: bool` (default `false` — stock
 behavior). When `true`, the history buffer **retains `persistent` (SetStoreInfo +

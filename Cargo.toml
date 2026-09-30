@@ -1,18 +1,20 @@
-# CERULION VENDORED FORK of re_grpc_server 0.34.1 (CER-858).
+# CERULION VENDORED FORK of re_grpc_server 0.34.1 (CER-858 + CER-959).
 #
-# This is upstream re_grpc_server 0.34.1 (rerun-io/rerun) + ONE localized patch:
+# This is upstream re_grpc_server 0.34.1 (rerun-io/rerun) + TWO localized patches:
 # a `ServerOptions::drop_temporal_history` mode that makes the per-client
 # connect-history retain the scene skeleton (persistent + static_) but NEVER
 # buffer disposable/temporal frames — Cerulion Studio's instant-only live viz
-# (no catch-up replay, no accumulation, no viewer-blueprint clobber). See
+# (no catch-up replay, no accumulation, no viewer-blueprint clobber), and a
+# `ServerOptions::live_temporal_budget_bytes` bound that DROPS a temporal
+# message instead of awaiting space in an over-budget live broadcast queue. See
 # CERULION-PATCH.md for the exact delta.
 #
-# Pinned into the workspace via the root Cargo.toml `[patch.crates-io]` (the
-# rustdds-fork precedent). Version stays 0.34.1 so it satisfies the whole re_*
-# graph's `=0.34.1` requirements (one version — `cargo tree | grep re_grpc`).
+# Pinned into the workspace via the root Cargo.toml `[patch.crates-io]`.
+# Version stays 0.34.1 so it satisfies the whole re_* graph's `=0.34.1`
+# requirements (one version — `cargo tree | grep re_grpc`).
 # Packaging-only fields from the published Cargo.toml (`include`, `readme`,
-# `publish`, `repository`, `homepage`, docs.rs metadata) are dropped — a local
-# path patch is never published.
+# `publish`, `repository`, `homepage`, docs.rs metadata) are dropped — a
+# git-pinned fork is never published.
 [package]
 edition = "2024"
 rust-version = "1.92"
