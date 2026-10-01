@@ -677,11 +677,19 @@ pub fn spawn_with_recv_and_services(
         }
     });
 
-    tokio::spawn(async move {
+    // The push into `channel_log_tx` is a THREAD-blocking send (the channel's quota
+    // waits on a condvar with no timeout once it has warned), so this loop runs on a
+    // blocking thread, as `serve_from_channel` and `spawn_from_rx_set` already do,
+    // and drives the async receive through the runtime handle. On an async worker
+    // the same send parks that worker for as long as the channel stays full.
+    let runtime = tokio::runtime::Handle::current();
+    tokio::task::spawn_blocking(move || {
         let mut app_id_cache = re_log_encoding::CachingApplicationIdInjector::default();
 
         loop {
-            let msg: anyhow::Result<DataSourceMessage> = match broadcast_log_rx.recv().await {
+            let msg: anyhow::Result<DataSourceMessage> = match runtime
+                .block_on(broadcast_log_rx.recv())
+            {
                 Ok(inner) => match inner {
                     LogOrTableMsgProto::LogMsg(msg) => match msg.msg {
                         Some(msg) => msg
